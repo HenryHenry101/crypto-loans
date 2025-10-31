@@ -8,7 +8,9 @@ import {DSTest} from "./utils/DSTest.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockSiloVault} from "./mocks/MockSiloVault.sol";
 import {MockPriceOracle} from "./mocks/MockPriceOracle.sol";
-import {MockBridgeAdapter} from "./mocks/MockBridgeAdapter.sol";
+import {MockAvalancheBridge} from "./mocks/MockAvalancheBridge.sol";
+import {MockBitcoinRelayer} from "./mocks/MockBitcoinRelayer.sol";
+import {MockDexRouter} from "./mocks/MockDexRouter.sol";
 
 contract TestMessenger is ICrossChainMessenger {
     bytes public lastPayload;
@@ -36,24 +38,37 @@ contract AvalancheLoanCoordinatorTest is DSTest {
     MockSiloVault private vault;
     MockPriceOracle private oracle;
     TestMessenger private messenger;
-    MockBridgeAdapter private bridge;
+    MockAvalancheBridge private bridgeVerifier;
+    MockBitcoinRelayer private relayer;
+    MockDexRouter private dex;
+    MockERC20 private stable;
 
     function setUp() public {
         btcB = new MockERC20("BTC.b", "BTCB", 18);
+        stable = new MockERC20("EURe", "EURE", 18);
         vault = new MockSiloVault(address(btcB));
         oracle = new MockPriceOracle(20_000 ether, block.timestamp);
         messenger = new TestMessenger();
-        bridge = new MockBridgeAdapter();
+        bridgeVerifier = new MockAvalancheBridge();
+        relayer = new MockBitcoinRelayer();
+        dex = new MockDexRouter();
+        dex.setExpectedAmountOut(1 ether);
         coordinator = new AvalancheLoanCoordinator(
             address(btcB),
             address(vault),
             address(oracle),
             address(messenger),
-            address(bridge)
+            address(bridgeVerifier),
+            address(relayer),
+            address(dex),
+            address(stable),
+            10 ether,
+            500
         );
         messenger.setTarget(address(coordinator));
         btcB.mint(address(this), 5 ether);
         btcB.approve(address(coordinator), type(uint256).max);
+        stable.mint(address(dex), 1000 ether);
     }
 
     function testDepositCreatesPositionAndMintsReceipt() public {
@@ -65,7 +80,7 @@ contract AvalancheLoanCoordinatorTest is DSTest {
         assertEq(position.collateralAmount, 1 ether, "collateral stored");
         assertEq(receipt.balanceOf(address(this)), 1 ether, "receipt minted");
         assertTrue(messenger.lastPayload().length > 0, "message emitted");
-        assertEq(bridge.proofUser(), address(this), "bridge proof user");
+        assertEq(bridgeVerifier.lastUser(), address(this), "bridge proof user");
     }
 
     function testRepaymentReleasesCollateral() public {
@@ -77,16 +92,19 @@ contract AvalancheLoanCoordinatorTest is DSTest {
         bytes memory payload = abi.encode("REPAYMENT_CONFIRMED", loanId, address(this), uint256(0), bytes("btc-params"));
         messenger.forward(payload, bytes("unused"));
 
-        assertEq(bridge.lastRecipient(), address(this), "recipient matches");
-        assertEq(bridge.lastAmount(), 2 ether, "amount bridged");
-        assertEq(bridge.lastParams(), bytes("btc-params"), "bridge params passed");
+        assertEq(relayer.lastRecipient(), address(this), "recipient matches");
+        assertEq(relayer.lastAmount(), 2 ether, "amount bridged");
+        assertEq(relayer.lastParams(), bytes("btc-params"), "bridge params passed");
+        assertEq(btcB.balanceOf(address(relayer)), 2 ether, "relayer received tokens");
     }
 
     function testDefaultTriggersLiquidation() public {
         (bytes32 loanId,) = coordinator.depositCollateral(1 ether, 5000, 30 days, bytes("proof"));
-        bytes memory payload = abi.encode("LOAN_DEFAULT", loanId, address(this), uint256(0), bytes("swap"));
+        dex.setExpectedAmountOut(0.99 ether);
+        bytes memory swapParams = abi.encode(0.97 ether, bytes("swap"));
+        bytes memory payload = abi.encode("LOAN_DEFAULT", loanId, address(this), uint256(0), swapParams);
         messenger.forward(payload, bytes("slippage"));
-
-        assertTrue(bridge.unwindCalled(), "liquidation path");
+        assertEq(dex.lastAmountIn(), 1 ether, "dex input amount");
+        assertEq(stable.balanceOf(address(this)), 0.99 ether, "stable received");
     }
 }

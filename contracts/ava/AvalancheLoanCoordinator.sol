@@ -8,6 +8,7 @@ import {ISiloVault} from "../interfaces/ISiloVault.sol";
 import {ICrossChainMessenger} from "../interfaces/ICrossChainMessenger.sol";
 import {IPriceOracle} from "../interfaces/IPriceOracle.sol";
 import {IBridgeAdapter} from "../interfaces/IBridgeAdapter.sol";
+import {AvalancheBridgeAdapter} from "../bridge/AvalancheBridgeAdapter.sol";
 import {OwnershipToken} from "./OwnershipToken.sol";
 
 /// @title AvalancheLoanCoordinator
@@ -73,28 +74,70 @@ contract AvalancheLoanCoordinator is Pausable, ReentrancyGuard {
     uint64 private _loanCounter;
     address public ethereumLoanManager;
 
+    event BridgeAdapterSet(address indexed adapter);
+
     constructor(
         address btcBToken_,
         address siloVault_,
         address priceOracle_,
         address messenger_,
-        address bridgeAdapter_
+        address bridgeVerifier_,
+        address relayer_,
+        address dex_,
+        address stableToken_,
+        uint256 maxBridgeAmount_,
+        uint256 maxSlippageBps_
     ) {
         require(btcBToken_ != address(0) && siloVault_ != address(0), "AddrZero");
         btcBToken = IERC20(btcBToken_);
         siloVault = ISiloVault(siloVault_);
         priceOracle = IPriceOracle(priceOracle_);
         messenger = ICrossChainMessenger(messenger_);
-        bridgeAdapter = IBridgeAdapter(bridgeAdapter_);
+        bridgeAdapter = IBridgeAdapter(
+            address(
+                new AvalancheBridgeAdapter(
+                    btcBToken_,
+                    stableToken_,
+                    bridgeVerifier_,
+                    relayer_,
+                    dex_,
+                    maxBridgeAmount_,
+                    maxSlippageBps_,
+                    msg.sender
+                )
+            )
+        );
         ownershipToken = new OwnershipToken("BTC Loan Receipt", "BTCREC", 18);
+        emit BridgeAdapterSet(address(bridgeAdapter));
     }
 
     function setMessenger(address messenger_) external onlyOwner {
         messenger = ICrossChainMessenger(messenger_);
     }
 
-    function setBridgeAdapter(address adapter_) external onlyOwner {
-        bridgeAdapter = IBridgeAdapter(adapter_);
+    function setBridgeAdapter(
+        address bridgeVerifier_,
+        address relayer_,
+        address dex_,
+        address stableToken_,
+        uint256 maxBridgeAmount_,
+        uint256 maxSlippageBps_
+    ) external onlyOwner {
+        bridgeAdapter = IBridgeAdapter(
+            address(
+                new AvalancheBridgeAdapter(
+                    address(btcBToken),
+                    stableToken_,
+                    bridgeVerifier_,
+                    relayer_,
+                    dex_,
+                    maxBridgeAmount_,
+                    maxSlippageBps_,
+                    owner()
+                )
+            )
+        );
+        emit BridgeAdapterSet(address(bridgeAdapter));
     }
 
     function setEthereumLoanManager(address manager_) external onlyOwner {
