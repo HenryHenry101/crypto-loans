@@ -33,6 +33,10 @@
             <span class="label">Cuenta Monerium</span>
             <span id="moneriumStatus">No vinculada</span>
           </div>
+          <div>
+            <span class="label">Precio BTC/EUR de referencia</span>
+            <span id="btcEurPrice">Actualizando…</span>
+          </div>
         </div>
       </section>
 
@@ -52,9 +56,26 @@
           <label>Duración del préstamo (días)
             <input type="number" id="duration" min="7" max="365" value="90" />
           </label>
+          <label>Método de desembolso
+            <select id="disburseVia">
+              <option value="wallet">EURe a wallet vinculada</option>
+              <option value="monerium">Transferencia SEPA vía Monerium</option>
+            </select>
+          </label>
+          <label>IBAN (si usas Monerium)
+            <input type="text" id="iban" placeholder="ES00 0000 0000 0000 0000 0000" />
+          </label>
+          <label>Referencia de transferencia
+            <input type="text" id="reference" placeholder="Referencia de pago" />
+          </label>
           <button type="submit">Request Loan</button>
         </form>
         <div id="simulationOutput"></div>
+      </section>
+
+      <section class="card">
+        <h2>Estado de la plataforma</h2>
+        <p id="platformMetrics">Cargando métricas…</p>
       </section>
 
       <section class="card">
@@ -65,6 +86,7 @@
               <th>ID</th>
               <th>Principal</th>
               <th>Colateral BTC.b</th>
+              <th>LTV actual</th>
               <th>Estado</th>
               <th>Fecha límite</th>
               <th></th>

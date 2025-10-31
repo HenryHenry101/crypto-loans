@@ -6,6 +6,21 @@ contract MockBridgeAdapter {
     uint256 public lastAmount;
     bytes public lastParams;
     bool public unwindCalled;
+    bool public proofValid = true;
+    address public proofUser;
+    uint256 public proofAmount;
+    bytes public proofData;
+
+    function setProofValid(bool value) external {
+        proofValid = value;
+    }
+
+    function validateBridgeProof(address user, uint256 amount, bytes calldata bridgeProof) external returns (bool) {
+        proofUser = user;
+        proofAmount = amount;
+        proofData = bridgeProof;
+        return proofValid;
+    }
 
     function bridgeToBitcoin(address user, uint256 amount, bytes calldata bridgeParams) external {
         lastRecipient = user;

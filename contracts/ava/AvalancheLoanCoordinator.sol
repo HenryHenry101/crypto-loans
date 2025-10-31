@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {Ownable} from "../libs/Ownable.sol";
+import {Pausable} from "../libs/Pausable.sol";
 import {ReentrancyGuard} from "../libs/ReentrancyGuard.sol";
 import {SafeERC20, IERC20} from "../libs/SafeERC20.sol";
 import {ISiloVault} from "../interfaces/ISiloVault.sol";
@@ -12,10 +12,17 @@ import {OwnershipToken} from "./OwnershipToken.sol";
 
 /// @title AvalancheLoanCoordinator
 /// @notice Handles BTC.b collateral lifecycle and cross-chain coordination with Ethereum loan manager.
-contract AvalancheLoanCoordinator is Ownable, ReentrancyGuard {
+contract AvalancheLoanCoordinator is Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    enum LoanState { None, Active, AwaitingUnlock, Releasing, Defaulted, Released }
+    enum LoanState {
+        None,
+        Active,
+        AwaitingUnlock,
+        Releasing,
+        Defaulted,
+        Released
+    }
 
     struct Position {
         address user;
@@ -25,18 +32,30 @@ contract AvalancheLoanCoordinator is Ownable, ReentrancyGuard {
         uint256 mintedTokens;
         uint256 ltvBps;
         uint64 createdAt;
+        uint64 deadline;
+        bytes32 bridgeProofHash;
         LoanState state;
     }
 
-    event CollateralDeposited(bytes32 indexed loanId, address indexed user, uint256 amountBTCb, uint256 principalEUR, uint256 ltvBps);
+    event CollateralDeposited(
+        bytes32 indexed loanId,
+        address indexed user,
+        uint256 amountBTCb,
+        uint256 principalEUR,
+        uint256 ltvBps,
+        uint64 deadline
+    );
     event OwnershipLocked(bytes32 indexed loanId, address indexed user);
     event CollateralReleased(bytes32 indexed loanId, address indexed user, uint256 amountBTCb);
     event LiquidationTriggered(bytes32 indexed loanId, address indexed user, uint256 amountBTCb);
+    event BridgeProofVerified(bytes32 indexed loanId, bytes32 proofHash);
+
     error InvalidAmount();
     error InvalidState();
     error OracleStale();
     error NotLoanOwner();
     error VaultShareMismatch();
+    error InvalidBridgeProof();
 
     uint256 public constant MAX_LTV_BPS = 7000; // 70%
     uint256 public constant ORACLE_TIMEOUT = 1 hours;
@@ -91,10 +110,14 @@ contract AvalancheLoanCoordinator is Ownable, ReentrancyGuard {
         uint256 ltvBps,
         uint64 duration,
         bytes calldata bridgeProof
-    ) external nonReentrant returns (bytes32 loanId, uint256 principalEUR) {
+    ) external nonReentrant whenNotPaused returns (bytes32 loanId, uint256 principalEUR) {
         if (amountBTCb == 0) revert InvalidAmount();
         if (ltvBps == 0 || ltvBps > MAX_LTV_BPS) revert InvalidAmount();
+        if (duration == 0) revert InvalidAmount();
         _ensureOracleFresh();
+
+        bool proofValid = bridgeAdapter.validateBridgeProof(msg.sender, amountBTCb, bridgeProof);
+        if (!proofValid) revert InvalidBridgeProof();
 
         btcBToken.safeTransferFrom(msg.sender, address(this), amountBTCb);
 
@@ -114,6 +137,8 @@ contract AvalancheLoanCoordinator is Ownable, ReentrancyGuard {
             mintedTokens: mintedTokens,
             ltvBps: ltvBps,
             createdAt: uint64(block.timestamp),
+            deadline: uint64(block.timestamp + duration),
+            bridgeProofHash: keccak256(bridgeProof),
             state: LoanState.Active
         });
 
@@ -134,10 +159,11 @@ contract AvalancheLoanCoordinator is Ownable, ReentrancyGuard {
         );
         messenger.sendMessage(payload);
 
-        emit CollateralDeposited(loanId, msg.sender, amountBTCb, principalEUR, ltvBps);
+        emit BridgeProofVerified(loanId, keccak256(bridgeProof));
+        emit CollateralDeposited(loanId, msg.sender, amountBTCb, principalEUR, ltvBps, positions[loanId].deadline);
     }
 
-    function lockOwnershipToken(bytes32 loanId) external {
+    function lockOwnershipToken(bytes32 loanId) external whenNotPaused {
         Position storage position = positions[loanId];
         if (position.state != LoanState.Active && position.state != LoanState.AwaitingUnlock) revert InvalidState();
         if (position.user != msg.sender) revert NotLoanOwner();
@@ -149,22 +175,28 @@ contract AvalancheLoanCoordinator is Ownable, ReentrancyGuard {
 
     function handleMessengerPayload(bytes calldata payload, bytes calldata params) external nonReentrant {
         require(msg.sender == address(messenger), "NotMessenger");
+        params; // silence unused warning - params reserved for future validation
 
         (string memory action, bytes32 loanId, address recipient, uint256 amount, bytes memory extraData) =
             abi.decode(payload, (string, bytes32, address, uint256, bytes));
 
-        if (keccak256(bytes(action)) == keccak256(bytes("REPAYMENT_CONFIRMED"))) {
-            _processRepayment(loanId, recipient, params);
-        } else if (keccak256(bytes(action)) == keccak256(bytes("LOAN_DEFAULT"))) {
+        bytes32 actionHash = keccak256(bytes(action));
+        if (actionHash == keccak256(bytes("REPAYMENT_CONFIRMED"))) {
+            _processRepayment(loanId, recipient, extraData);
+        } else if (actionHash == keccak256(bytes("LOAN_DEFAULT"))) {
             _processDefault(loanId, recipient, amount, extraData);
-        } else if (keccak256(bytes(action)) == keccak256(bytes("UPDATE_MANAGER"))) {
+        } else if (actionHash == keccak256(bytes("UPDATE_MANAGER"))) {
             ethereumLoanManager = recipient;
         } else {
             revert("UnknownAction");
         }
     }
 
-    function _processRepayment(bytes32 loanId, address btcRecipient, bytes calldata bridgeParams) internal {
+    function emergencyWithdraw(address token, address to, uint256 amount) external onlyOwner {
+        IERC20(token).safeTransfer(to, amount);
+    }
+
+    function _processRepayment(bytes32 loanId, address btcRecipient, bytes memory bridgeParams) internal {
         Position storage position = positions[loanId];
         if (position.state != LoanState.AwaitingUnlock) revert InvalidState();
 
@@ -174,6 +206,7 @@ contract AvalancheLoanCoordinator is Ownable, ReentrancyGuard {
         ownershipToken.burn(address(this), position.mintedTokens);
         position.state = LoanState.Releasing;
 
+        btcBToken.safeApprove(address(bridgeAdapter), 0);
         btcBToken.safeApprove(address(bridgeAdapter), position.collateralAmount);
         bridgeAdapter.bridgeToBitcoin(btcRecipient, position.collateralAmount, bridgeParams);
 
@@ -181,7 +214,7 @@ contract AvalancheLoanCoordinator is Ownable, ReentrancyGuard {
         emit CollateralReleased(loanId, position.user, position.collateralAmount);
     }
 
-    function _processDefault(bytes32 loanId, address payoutRecipient, uint256 /*unused*/, bytes calldata swapParams) internal {
+    function _processDefault(bytes32 loanId, address payoutRecipient, uint256, bytes memory swapParams) internal {
         Position storage position = positions[loanId];
         if (position.state == LoanState.Defaulted || position.state == LoanState.Released) revert InvalidState();
 
@@ -191,6 +224,7 @@ contract AvalancheLoanCoordinator is Ownable, ReentrancyGuard {
         position.state = LoanState.Defaulted;
         ownershipToken.burn(position.user, position.mintedTokens);
 
+        btcBToken.safeApprove(address(bridgeAdapter), 0);
         btcBToken.safeApprove(address(bridgeAdapter), position.collateralAmount);
         bridgeAdapter.unwindToStable(payoutRecipient, position.collateralAmount, swapParams);
 

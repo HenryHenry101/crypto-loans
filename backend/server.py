@@ -1,78 +1,26 @@
-"""Enhanced backend stub orchestrating Monerium, bridge operations and secured loan storage."""
-
+"""Production-ready HTTP backend orchestrator for Crypto Loans."""
 from __future__ import annotations
 
 import base64
 import hmac
 import json
+import logging
 import os
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any, Dict, Optional, Tuple
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Deque, Dict, Optional, Tuple
 
+from store import LoanStore
 
-class LoanStore:
-    """Thread-safe in-memory store with audit trail support."""
-
-    def __init__(self) -> None:
-        self._loans: Dict[str, Dict[str, Any]] = {}
-        self._lock = threading.Lock()
-        self._counter = 0
-
-    def _next_id(self) -> str:
-        self._counter += 1
-        return f"loan-{self._counter:06d}"
-
-    def create(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        with self._lock:
-            loan_id = str(payload.get("loanId") or self._next_id())
-            payload = dict(payload)
-            payload["loanId"] = loan_id
-            payload.setdefault("status", "active")
-            payload.setdefault("createdAt", int(time.time()))
-            payload.setdefault("history", [])
-            self._loans[loan_id] = payload
-            return dict(payload)
-
-    def list(self) -> Dict[str, Dict[str, Any]]:
-        with self._lock:
-            return {loan_id: dict(data) for loan_id, data in self._loans.items()}
-
-    def get(self, loan_id: str) -> Optional[Dict[str, Any]]:
-        with self._lock:
-            record = self._loans.get(loan_id)
-            return dict(record) if record else None
-
-    def update(self, loan_id: str, **fields: Any) -> Dict[str, Any]:
-        with self._lock:
-            loan = self._loans.setdefault(loan_id, {"loanId": loan_id, "history": []})
-            loan.update(fields)
-            return dict(loan)
-
-    def record_event(self, loan_id: str, event: str, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        with self._lock:
-            loan = self._loans.setdefault(loan_id, {"loanId": loan_id, "history": []})
-            entry = {
-                "event": event,
-                "metadata": metadata or {},
-                "timestamp": int(time.time()),
-            }
-            loan.setdefault("history", []).append(entry)
-            return dict(entry)
-
-    def mark_repaid(self, loan_id: str, amount: float) -> Dict[str, Any]:
-        event = self.record_event(loan_id, "repayment-recorded", {"amount": amount})
-        with self._lock:
-            loan = self._loans.setdefault(loan_id, {"loanId": loan_id, "history": [event]})
-            loan["status"] = "repaid"
-            loan["repaidAmount"] = amount
-            loan["repaidAt"] = event["timestamp"]
-            return dict(loan)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+LOGGER = logging.getLogger("crypto-loans.backend")
 
 
 class APIError(Exception):
@@ -83,14 +31,38 @@ class APIError(Exception):
         self.details = details or {}
 
 
+class RateLimiter:
+    """IP-based rate limiter to mitigate abusive clients."""
+
+    def __init__(self, limit: int = 120, window: int = 60) -> None:
+        self.limit = limit
+        self.window = window
+        self._records: Dict[str, Deque[float]] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, key: str) -> bool:
+        now = time.time()
+        with self._lock:
+            bucket = self._records.setdefault(key, deque())
+            while bucket and now - bucket[0] > self.window:
+                bucket.popleft()
+            if len(bucket) >= self.limit:
+                return False
+            bucket.append(now)
+            return True
+
+
 class MoneriumClient:
-    """Tiny Monerium API helper handling OAuth2 client credentials."""
+    """Thin Monerium API helper handling OAuth2 client credentials."""
 
     def __init__(self) -> None:
         self.base_url = os.getenv("MONERIUM_BASE_URL", "https://api.monerium.dev")
         self.client_id = os.getenv("MONERIUM_CLIENT_ID")
         self.client_secret = os.getenv("MONERIUM_CLIENT_SECRET")
-        self.scope = os.getenv("MONERIUM_SCOPE", "offline_access transactions:write transactions:read")
+        self.scope = os.getenv(
+            "MONERIUM_SCOPE",
+            "offline_access transactions:write transactions:read",
+        )
         self._token: Optional[Tuple[str, float]] = None
         self._lock = threading.Lock()
 
@@ -158,7 +130,7 @@ class MoneriumClient:
 
 
 class AvalancheBridgeClient:
-    """Wrapper around the public Avalanche Bridge API endpoints."""
+    """Wrapper around Avalanche Bridge API endpoints."""
 
     def __init__(self) -> None:
         self.base_url = os.getenv("AVALANCHE_BRIDGE_URL", "https://bridge-api.avax.network")
@@ -207,13 +179,105 @@ class AvalancheBridgeClient:
         return self._request("GET", f"/v1/transactions/{transaction_id}")
 
 
-LOANS = LoanStore()
+class PriceOracleClient:
+    """Fetches BTC/EUR reference prices with caching and fallback."""
+
+    def __init__(self) -> None:
+        self.endpoint = os.getenv(
+            "PRICE_FEED_URL",
+            "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=eur",
+        )
+        self.static_price = os.getenv("STATIC_BTC_EUR")
+        self.timeout = int(os.getenv("PRICE_FEED_TIMEOUT", "10"))
+        self.cache_ttl = int(os.getenv("PRICE_FEED_CACHE", "60"))
+        self._cache: Optional[Tuple[float, float]] = None  # (timestamp, price)
+
+    def current_price(self) -> float:
+        if self.static_price is not None:
+            return float(self.static_price)
+        now = time.time()
+        if self._cache and now - self._cache[0] < self.cache_ttl:
+            return self._cache[1]
+        try:
+            with urllib.request.urlopen(self.endpoint, timeout=self.timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+                price = float(payload["bitcoin"]["eur"])
+                self._cache = (now, price)
+                return price
+        except Exception as exc:  # pragma: no cover - network error path
+            if self._cache:
+                LOGGER.warning("Price feed failed (%s), returning cached price", exc)
+                return self._cache[1]
+            raise APIError(HTTPStatus.BAD_GATEWAY, "Unable to fetch BTC/EUR price", {"error": str(exc)})
+
+
+class RiskMonitor(threading.Thread):
+    """Background task that recalculates LTV and flags risky loans."""
+
+    def __init__(self, store: LoanStore, oracle: PriceOracleClient, *, warn_ltv: float = 0.65, liquidate_ltv: float = 0.7,
+                 interval: int = 60) -> None:
+        super().__init__(daemon=True)
+        self.store = store
+        self.oracle = oracle
+        self.warn_ltv = warn_ltv
+        self.liquidate_ltv = liquidate_ltv
+        self.interval = interval
+        self._stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def run(self) -> None:  # pragma: no cover - background loop
+        LOGGER.info("Risk monitor started")
+        while not self._stop_event.is_set():
+            try:
+                price = self.oracle.current_price()
+                loans = self.store.list()
+                for loan_id, loan in loans.items():
+                    if not loan or loan.get("status") != "active":
+                        continue
+                    collateral = float(loan.get("collateralBTCb") or 0)
+                    principal = float(loan.get("principal") or 0)
+                    if collateral <= 0:
+                        continue
+                    collateral_value = collateral * price
+                    if collateral_value <= 0:
+                        continue
+                    ltv = principal / collateral_value
+                    self.store.update_health(loan_id, price_eur=price, ltv=ltv)
+                    if ltv >= self.liquidate_ltv:
+                        LOGGER.warning("Loan %s marked default due to LTV %.3f", loan_id, ltv)
+                        self.store.mark_default(loan_id, "ltv-threshold", ltv)
+                    elif ltv >= self.warn_ltv:
+                        self.store.record_event(
+                            loan_id,
+                            "ltv-warning",
+                            {"ltv": ltv, "threshold": self.warn_ltv},
+                        )
+            except APIError as exc:
+                LOGGER.error("Risk monitor error: %s", exc)
+            except Exception as exc:  # pragma: no cover - unforeseen error path
+                LOGGER.exception("Unexpected risk monitor failure: %s", exc)
+            self._stop_event.wait(self.interval)
+        LOGGER.info("Risk monitor stopped")
+
+
+STORE = LoanStore()
 MONERIUM = MoneriumClient()
 BRIDGE = AvalancheBridgeClient()
+PRICES = PriceOracleClient()
+RATE_LIMITER = RateLimiter(
+    limit=int(os.getenv("RATE_LIMIT", "120")),
+    window=int(os.getenv("RATE_LIMIT_WINDOW", "60")),
+)
+RISK_MONITOR = RiskMonitor(STORE, PRICES, interval=int(os.getenv("RISK_INTERVAL", "120")))
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "CryptoLoans/0.2"
+    server_version = "CryptoLoans/1.0"
+
+    def log_message(self, format: str, *args: Any) -> None:  # pragma: no cover - logging override
+        LOGGER.info("%s - %s", self.address_string(), format % args)
 
     def _json(self, status: int, payload: Dict[str, Any]) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -238,19 +302,42 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _rate_limit(self) -> bool:
+        remote = self.client_address[0]
+        if not RATE_LIMITER.allow(remote):
+            self._json(HTTPStatus.TOO_MANY_REQUESTS, {"error": "rate-limit", "retryIn": RATE_LIMITER.window})
+            return False
+        return True
+
+    def do_OPTIONS(self) -> None:  # noqa: N802 - preflight support
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type,X-API-Key")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,OPTIONS")
+        self.end_headers()
+
+    def end_headers(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        super().end_headers()
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/health":
-            self._json(HTTPStatus.OK, {"ok": True})
+            self._json(HTTPStatus.OK, {"ok": True, "version": self.server_version})
             return
-        if not self._ensure_authorized():
+        if not self._rate_limit() or not self._ensure_authorized():
             return
         if parsed.path == "/loans":
-            self._json(HTTPStatus.OK, {"data": list(LOANS.list().values())})
+            self._json(HTTPStatus.OK, {"data": list(STORE.list().values())})
             return
         if parsed.path.startswith("/loans/"):
-            loan_id = parsed.path.split("/")[-1]
-            loan = LOANS.get(loan_id)
+            parts = parsed.path.split("/")
+            loan_id = parts[2]
+            if len(parts) == 4 and parts[3] == "history":
+                history = STORE.history(loan_id)
+                self._json(HTTPStatus.OK, {"data": history})
+                return
+            loan = STORE.get(loan_id)
             if not loan:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "loan not found"})
                 return
@@ -269,27 +356,42 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._json(HTTPStatus.OK, {"data": data})
             return
+        if parsed.path == "/pricing/btc-eur":
+            try:
+                price = PRICES.current_price()
+            except APIError as exc:
+                self._json(exc.status, {"error": exc.message, "details": exc.details})
+                return
+            self._json(HTTPStatus.OK, {"data": {"price": price}})
+            return
+        if parsed.path == "/metrics":
+            loans = STORE.list()
+            active = sum(1 for loan in loans.values() if loan and loan.get("status") == "active")
+            repaid = sum(1 for loan in loans.values() if loan and loan.get("status") == "repaid")
+            defaulted = sum(1 for loan in loans.values() if loan and loan.get("status") == "defaulted")
+            self._json(
+                HTTPStatus.OK,
+                {"data": {"total": len(loans), "active": active, "repaid": repaid, "defaulted": defaulted}},
+            )
+            return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path not in {"/health"} and not self._ensure_authorized():
+        if parsed.path not in {"/health"} and (not self._rate_limit() or not self._ensure_authorized()):
             return
         payload = self._read_json()
         try:
             if parsed.path == "/loans":
-                loan = LOANS.create(payload)
-                LOANS.record_event(loan["loanId"], "loan-created", {k: loan.get(k) for k in ("principal", "ltv", "duration")})
-                if payload.get("disburseVia") == "monerium" and payload.get("iban"):
-                    payout = MONERIUM.redeem(payload["iban"], float(payload.get("principal", 0)), payload.get("reference", "Loan disbursement"))
-                    loan = LOANS.update(loan["loanId"], moneriumPayout=payout)
+                loan = self._handle_create_loan(payload)
                 self._json(HTTPStatus.CREATED, {"data": loan})
                 return
             if parsed.path == "/repay":
                 loan_id = str(payload.get("loanId"))
                 amount = float(payload.get("amount", 0))
-                loan = LOANS.mark_repaid(loan_id, amount)
-                LOANS.record_event(loan_id, "repayment-submitted", {"amount": amount, "via": payload.get("via", "manual")})
+                via = payload.get("via", "manual")
+                loan = STORE.mark_repaid(loan_id, amount)
+                STORE.record_event(loan_id, "repayment-submitted", {"amount": amount, "via": via})
                 self._json(HTTPStatus.OK, {"data": loan})
                 return
             if parsed.path == "/monerium/redeem":
@@ -302,7 +404,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/bridge/wrap":
                 result = BRIDGE.initiate_wrap(payload["btcTxId"], payload["targetAddress"], payload.get("network", "mainnet"))
-                LOANS.record_event(payload.get("loanId", "unknown"), "bridge-wrap", result)
+                STORE.record_event(payload.get("loanId", "unknown"), "bridge-wrap", result)
                 self._json(HTTPStatus.OK, {"data": result})
                 return
             if parsed.path == "/bridge/unwrap":
@@ -312,8 +414,14 @@ class Handler(BaseHTTPRequestHandler):
                     payload["sourceAddress"],
                     payload.get("network", "mainnet"),
                 )
-                LOANS.record_event(payload.get("loanId", "unknown"), "bridge-unwrap", result)
+                STORE.record_event(payload.get("loanId", "unknown"), "bridge-unwrap", result)
                 self._json(HTTPStatus.OK, {"data": result})
+                return
+            if parsed.path == "/loans/default":
+                loan_id = payload["loanId"]
+                reason = payload.get("reason", "manual-default")
+                record = STORE.mark_default(loan_id, reason)
+                self._json(HTTPStatus.OK, {"data": record})
                 return
         except KeyError as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": f"missing field {exc.args[0]}"})
@@ -321,17 +429,60 @@ class Handler(BaseHTTPRequestHandler):
         except APIError as exc:
             self._json(exc.status, {"error": exc.message, "details": exc.details})
             return
+        except ValueError as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+
+    def do_PATCH(self) -> None:  # noqa: N802
+        parsed = urllib.parse.urlparse(self.path)
+        if not self._rate_limit() or not self._ensure_authorized():
+            return
+        if not parsed.path.startswith("/loans/"):
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+            return
+        loan_id = parsed.path.split("/")[2]
+        payload = self._read_json()
+        status = payload.get("status")
+        if status not in {"active", "repaid", "defaulted"}:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid status"})
+            return
+        record = STORE.update(loan_id, status=status)
+        STORE.record_event(loan_id, "status-updated", {"status": status})
+        self._json(HTTPStatus.OK, {"data": record})
+
+    def _handle_create_loan(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        principal = float(payload.get("principal", 0))
+        collateral = float(payload.get("collateralBTCb", 0))
+        ltv = float(payload.get("ltv", 0))
+        if not principal or not collateral:
+            raise ValueError("principal and collateralBTCb are required")
+        if ltv <= 0 or ltv > 70:
+            raise ValueError("ltv must be between 0 and 70")
+        duration = int(payload.get("duration", 0))
+        if duration <= 0:
+            raise ValueError("duration must be greater than zero")
+        loan = STORE.create(payload)
+        STORE.record_event(loan["loanId"], "loan-validated", {"principal": principal, "collateral": collateral})
+        if payload.get("disburseVia") == "monerium" and payload.get("iban"):
+            payout = MONERIUM.redeem(payload["iban"], principal, payload.get("reference", "Loan disbursement"))
+            loan = STORE.update(loan["loanId"], moneriumPayout=payout)
+            STORE.record_event(loan["loanId"], "payout-executed", {"provider": "monerium"})
+        return loan
 
 
 def run(port: int = 8080) -> None:
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    print(f"Crypto Loans backend listening on http://0.0.0.0:{port}")
+    if not RISK_MONITOR.is_alive():
+        RISK_MONITOR.start()
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    LOGGER.info("Crypto Loans backend listening on http://0.0.0.0:%s", port)
     try:
         server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+    except KeyboardInterrupt:  # pragma: no cover - manual stop
+        LOGGER.info("Shutting down due to interrupt")
     finally:
+        RISK_MONITOR.stop()
+        server.shutdown()
         server.server_close()
 
 

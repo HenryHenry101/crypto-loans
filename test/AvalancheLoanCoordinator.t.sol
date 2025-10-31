@@ -57,7 +57,7 @@ contract AvalancheLoanCoordinatorTest is DSTest {
     }
 
     function testDepositCreatesPositionAndMintsReceipt() public {
-        (bytes32 loanId, uint256 principal) = coordinator.depositCollateral(1 ether, 5000, 30 days, hex"");
+        (bytes32 loanId, uint256 principal) = coordinator.depositCollateral(1 ether, 5000, 30 days, bytes("proof"));
         AvalancheLoanCoordinator.Position memory position = coordinator.positions(loanId);
         OwnershipToken receipt = coordinator.ownershipToken();
 
@@ -65,23 +65,25 @@ contract AvalancheLoanCoordinatorTest is DSTest {
         assertEq(position.collateralAmount, 1 ether, "collateral stored");
         assertEq(receipt.balanceOf(address(this)), 1 ether, "receipt minted");
         assertTrue(messenger.lastPayload().length > 0, "message emitted");
+        assertEq(bridge.proofUser(), address(this), "bridge proof user");
     }
 
     function testRepaymentReleasesCollateral() public {
-        (bytes32 loanId,) = coordinator.depositCollateral(2 ether, 6000, 30 days, hex"");
+        (bytes32 loanId,) = coordinator.depositCollateral(2 ether, 6000, 30 days, bytes("proof"));
         OwnershipToken receipt = coordinator.ownershipToken();
         receipt.approve(address(coordinator), 2 ether);
         coordinator.lockOwnershipToken(loanId);
 
-        bytes memory payload = abi.encode("REPAYMENT_CONFIRMED", loanId, address(this), uint256(0), bytes("proof"));
-        messenger.forward(payload, bytes("btc-params"));
+        bytes memory payload = abi.encode("REPAYMENT_CONFIRMED", loanId, address(this), uint256(0), bytes("btc-params"));
+        messenger.forward(payload, bytes("unused"));
 
         assertEq(bridge.lastRecipient(), address(this), "recipient matches");
         assertEq(bridge.lastAmount(), 2 ether, "amount bridged");
+        assertEq(bridge.lastParams(), bytes("btc-params"), "bridge params passed");
     }
 
     function testDefaultTriggersLiquidation() public {
-        (bytes32 loanId,) = coordinator.depositCollateral(1 ether, 5000, 30 days, hex"");
+        (bytes32 loanId,) = coordinator.depositCollateral(1 ether, 5000, 30 days, bytes("proof"));
         bytes memory payload = abi.encode("LOAN_DEFAULT", loanId, address(this), uint256(0), bytes("swap"));
         messenger.forward(payload, bytes("slippage"));
 

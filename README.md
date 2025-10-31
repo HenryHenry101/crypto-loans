@@ -16,9 +16,9 @@ orquestación y una interfaz web estática para operar los préstamos.
   - `messaging/ChainlinkCCIPMessenger.sol`: adaptador listo para producción que
     conecta con Chainlink CCIP para enviar y recibir payloads entre redes.
   - `messaging/MockMessenger.sol`: mensajero ligero para pruebas locales.
-- `backend/server.py` – Servidor HTTP ligero (sin dependencias externas) que
-  actúa como orquestador demostrativo con integraciones a Monerium y Avalanche
-  Bridge.
+- `backend/server.py` – Servidor HTTP de producción ligera (sin dependencias
+  externas) que actúa como orquestador con integraciones a Monerium y
+  Avalanche Bridge, almacenamiento persistente y monitorización de riesgo.
 - `frontend/` – Aplicación web estática con simulador de LTV, seguimiento de
   préstamos y formularios de repago.
 - `test/` – Suite de Foundry con mocks de dependencias externas y pruebas de
@@ -47,7 +47,8 @@ necesarias en tu entorno local). Las piezas clave son:
 
 - Registra nuevos préstamos tras recibir la notificación desde Avalanche.
 - Entrega EURe al usuario (directamente o a una cuenta Monerium vinculada).
-- Registra repagos y envía la orden de liberar el colateral.
+- Registra repagos, adjunta los parámetros necesarios para el bridge de vuelta
+  a BTC y envía la orden de liberar el colateral.
 - Permite marcar préstamos en default para iniciar la liquidación.
 
 ### Mensajería cross-chain
@@ -61,11 +62,17 @@ locales sigue disponible `MockMessenger`.
 ## Backend
 
 El backend en `backend/server.py` expone endpoints REST (`/loans`, `/repay`,
-`/monerium/*`, `/bridge/*`, `/health`) protegidos mediante API key opcional.
-Incluye clientes ligeros para Monerium (OAuth2 client credentials) y para el
-Avalanche Bridge, además de un almacén en memoria con trazabilidad de eventos
-de cada préstamo. Su objetivo sigue siendo actuar como blueprint de referencia
-para migrar posteriormente a un framework robusto (FastAPI, NestJS).
+`/monerium/*`, `/bridge/*`, `/health`, `/metrics`, `/pricing/btc-eur`) protegidos
+mediante API key opcional. Incluye clientes ligeros para Monerium (OAuth2 client
+credentials) y para el Avalanche Bridge, almacén persistente basado en SQLite y
+un monitor de riesgo en segundo plano que recalcula el LTV de cada préstamo y
+emite eventos de alerta o default cuando los umbrales configurables se
+superan.
+
+Las respuestas de la API incluyen trazabilidad completa mediante el endpoint
+`/loans/{id}/history`. El rate limiting integrado evita abusos, mientras que el
+monitor automático permite detectar préstamos en riesgo y marcarlos como
+`defaulted` sin intervención manual.
 
 Para ejecutarlo:
 
@@ -80,6 +87,12 @@ externas:
 - `MONERIUM_CLIENT_ID` y `MONERIUM_CLIENT_SECRET`: credenciales OAuth2.
 - `MONERIUM_BASE_URL`: (opcional) apunta al entorno sandbox.
 - `AVALANCHE_BRIDGE_URL`: (opcional) URL del bridge (por defecto la pública).
+- `LOANSTORE_PATH`: (opcional) ruta de la base de datos SQLite para almacenar
+  préstamos y eventos.
+- `STATIC_BTC_EUR`: permite fijar un precio BTC/EUR (se prefiere dejarlo vacío
+  para usar la cotización en vivo).
+- `RATE_LIMIT` y `RATE_LIMIT_WINDOW`: controlan la política de rate limiting.
+- `RISK_INTERVAL`: frecuencia en segundos del monitor de riesgo automático.
 
 ## Frontend
 
@@ -93,8 +106,11 @@ python -m http.server --directory frontend 9000
 La aplicación permite:
 
 - Conectar una wallet Web3 (utilizando `window.ethereum`).
-- Simular préstamos en función del LTV.
-- Listar préstamos activos y lanzar el flujo de repago.
+- Consultar precios BTC/EUR en tiempo real y simular préstamos según el LTV
+  deseado.
+- Registrar préstamos y repagos consumiendo la API del backend protegido con
+  API key.
+- Visualizar métricas agregadas y el historial de eventos de cada préstamo.
 
 ## Pruebas automatizadas
 

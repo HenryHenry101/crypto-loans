@@ -124,6 +124,21 @@ button[type="submit"] {
   background: rgba(88, 166, 255, 0.08);
 }
 
+.success {
+  color: #3fb950;
+  font-weight: 600;
+}
+
+.error {
+  color: #f85149;
+  font-weight: 600;
+}
+
+#platformMetrics {
+  font-weight: 600;
+  font-size: 1.05rem;
+}
+
 footer {
   text-align: center;
   padding: 2rem 1rem;
