@@ -1,0 +1,16 @@
+{
+  "name": "crypto-loans",
+  "version": "1.0.0",
+  "description": "Blueprint funcional para préstamos descentralizados respaldados por BTC.",
+  "private": true,
+  "scripts": {
+    "dev:backend": "python backend/server.py",
+    "dev:frontend": "python -m http.server --directory frontend 9000"
+  },
+  "keywords": [
+    "defi",
+    "bitcoin",
+    "lending"
+  ],
+  "license": "MIT"
+}
