@@ -82,6 +82,24 @@ class LoanStore:
                 ON monerium_links(binding_hash)
                 """
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS terms_acceptance (
+                    wallet TEXT PRIMARY KEY,
+                    terms_hash TEXT NOT NULL,
+                    signature TEXT NOT NULL,
+                    message TEXT,
+                    accepted_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_terms_acceptance_hash
+                ON terms_acceptance(terms_hash)
+                """
+            )
 
     def _fetch(self, loan_id: str) -> Optional[Dict[str, Any]]:
         cursor = self._conn.execute("SELECT data FROM loans WHERE loan_id = ?", (loan_id,))
@@ -182,6 +200,29 @@ class LoanStore:
             "status": "linked",
         }
 
+    def _fetch_terms_acceptance(self, wallet: str) -> Optional[Dict[str, Any]]:
+        cursor = self._conn.execute(
+            """
+            SELECT wallet, terms_hash, signature, message, accepted_at, updated_at
+            FROM terms_acceptance WHERE wallet = ?
+            """,
+            (wallet,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        message = _json_loads(row[3]) if row[3] else {}
+        record = {
+            "wallet": row[0],
+            "termsHash": row[1],
+            "signature": row[2],
+            "message": message,
+            "acceptedAt": int(row[4]),
+            "updatedAt": int(row[5]),
+            "status": "accepted",
+        }
+        return record
+
     def link_monerium_wallet(
         self,
         wallet: str,
@@ -246,6 +287,54 @@ class LoanStore:
         wallet_norm = wallet.strip().lower()
         with self._lock:
             return self._fetch_monerium_link(wallet_norm)
+
+    def record_terms_acceptance(
+        self,
+        wallet: str,
+        terms_hash: str,
+        signature: str,
+        *,
+        message: Optional[Dict[str, Any]] = None,
+        accepted_at: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        wallet_norm = wallet.strip().lower()
+        if not wallet_norm:
+            raise ValueError("wallet is required")
+        hash_value = (terms_hash or "").strip().lower()
+        if not hash_value:
+            raise ValueError("terms_hash is required")
+        if not hash_value.startswith("0x"):
+            hash_value = f"0x{hash_value}"
+        payload = dict(message or {})
+        timestamp = int(accepted_at or payload.get("timestamp") or time.time())
+        payload.setdefault("wallet", wallet_norm)
+        payload.setdefault("termsHash", hash_value)
+        payload.setdefault("timestamp", timestamp)
+        encoded_message = _json_dumps(payload)
+        updated_at = int(time.time())
+        with self._lock:
+            with self._conn:  # type: ignore[call-arg]
+                self._conn.execute(
+                    """
+                    INSERT INTO terms_acceptance(wallet, terms_hash, signature, message, accepted_at, updated_at)
+                    VALUES(?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(wallet) DO UPDATE SET
+                        terms_hash = excluded.terms_hash,
+                        signature = excluded.signature,
+                        message = excluded.message,
+                        accepted_at = excluded.accepted_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (wallet_norm, hash_value, signature, encoded_message, timestamp, updated_at),
+                )
+        return self.get_terms_acceptance(wallet_norm) or {}
+
+    def get_terms_acceptance(self, wallet: str) -> Optional[Dict[str, Any]]:
+        wallet_norm = wallet.strip().lower()
+        if not wallet_norm:
+            return None
+        with self._lock:
+            return self._fetch_terms_acceptance(wallet_norm)
 
     def require_monerium_link(
         self,

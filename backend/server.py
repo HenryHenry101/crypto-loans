@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import hmac
 import json
 import logging
@@ -35,14 +36,68 @@ from store import LoanStore, normalize_iban
 
 try:  # pragma: no cover - optional dependency for signature recovery
     from eth_account import Account
-    from eth_account.messages import encode_defunct
+    from eth_account.messages import encode_defunct, encode_structured_data
 except Exception:  # pragma: no cover - optional dependency missing
     Account = None  # type: ignore
     encode_defunct = None  # type: ignore
+    encode_structured_data = None  # type: ignore
+
+try:  # pragma: no cover - optional dependency for checksum
+    from eth_utils import to_checksum_address
+except Exception:  # pragma: no cover - dependency missing
+    to_checksum_address = None  # type: ignore
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 LOGGER = logging.getLogger("crypto-loans.backend")
+
+
+TERMS_VERSION = os.getenv("TERMS_VERSION", "1")
+TERMS_TEXT = (
+    "Al solicitar este préstamo confirmas que comprendes los riesgos asociados al uso de criptoactivos como colateral, "
+    "aceptas la liquidación automática en caso de incumplimiento del LTV pactado y autorizas al coordinador a ejecutar el "
+    "colateral si fuese necesario. Declaras que los fondos no proceden de actividades ilícitas y que cumplirás con la "
+    "legislación vigente en materia de prevención de blanqueo de capitales.\n"
+    "La solicitud queda sujeta a disponibilidad de liquidez en la plataforma y a verificaciones adicionales de seguridad. "
+    "El incumplimiento de pagos conlleva cargos adicionales y puede resultar en la liquidación total del colateral aportado."
+)
+TERMS_HASH = "0x" + hashlib.sha256(TERMS_TEXT.encode("utf-8")).hexdigest()
+TERMS_CHAIN_ID = int(os.getenv("TERMS_CHAIN_ID", "43114"))
+TERMS_VERIFIER = os.getenv("TERMS_VERIFIER", "0x0000000000000000000000000000000000000000") or "0x0000000000000000000000000000000000000000"
+TERMS_DOMAIN_NAME = os.getenv("TERMS_DOMAIN_NAME", "CryptoLoans Terms")
+
+
+def _checksum_address(value: str) -> str:
+    candidate = (value or "0x0000000000000000000000000000000000000000").strip()
+    if not candidate:
+        candidate = "0x0000000000000000000000000000000000000000"
+    if to_checksum_address:
+        try:
+            return to_checksum_address(candidate)
+        except Exception:  # pragma: no cover - checksum conversion failure
+            return candidate
+    return candidate
+
+
+TERMS_DOMAIN = {
+    "name": TERMS_DOMAIN_NAME,
+    "version": TERMS_VERSION,
+    "chainId": TERMS_CHAIN_ID,
+    "verifyingContract": _checksum_address(TERMS_VERIFIER),
+}
+TERMS_TYPES = {
+    "EIP712Domain": [
+        {"name": "name", "type": "string"},
+        {"name": "version", "type": "string"},
+        {"name": "chainId", "type": "uint256"},
+        {"name": "verifyingContract", "type": "address"},
+    ],
+    "TermsAcceptance": [
+        {"name": "wallet", "type": "address"},
+        {"name": "termsHash", "type": "bytes32"},
+        {"name": "timestamp", "type": "uint256"},
+    ],
+}
 
 
 class APIError(Exception):
@@ -92,6 +147,85 @@ def _recover_wallet_from_signature(message: str, signature: str, wallet_hint: Op
     if not wallet_hint_normalized:
         raise APIError(HTTPStatus.PRECONDITION_REQUIRED, "wallet required to validate signature")
     return wallet_hint_normalized
+
+
+def _coalesce_address(*candidates: Any) -> str:
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        candidate_str = str(candidate).strip()
+        if candidate_str and candidate_str.lower() != "none":
+            return candidate_str
+    return ""
+
+
+def _validate_terms_acceptance(payload: Dict[str, Any], borrower_wallet: str) -> Dict[str, Any]:
+    if not payload:
+        raise APIError(HTTPStatus.PRECONDITION_REQUIRED, "terms acceptance is required")
+    signature = str(payload.get("signature") or payload.get("termsSignature") or "").strip()
+    if not signature:
+        raise APIError(HTTPStatus.BAD_REQUEST, "terms acceptance signature missing")
+    wallet_candidate = _coalesce_address(payload.get("wallet"), payload.get("address"), borrower_wallet)
+    if not wallet_candidate:
+        raise APIError(HTTPStatus.PRECONDITION_REQUIRED, "wallet is required for terms acceptance")
+    borrower_norm = str(borrower_wallet or "").strip().lower()
+    wallet_norm = wallet_candidate.strip().lower()
+    if borrower_norm and wallet_norm != borrower_norm:
+        raise APIError(HTTPStatus.BAD_REQUEST, "terms acceptance wallet mismatch")
+    terms_hash_value = str(payload.get("termsHash") or payload.get("terms_hash") or "").strip()
+    if not terms_hash_value:
+        raise APIError(HTTPStatus.BAD_REQUEST, "terms hash missing")
+    if not terms_hash_value.startswith("0x"):
+        terms_hash_value = f"0x{terms_hash_value}"
+    if terms_hash_value.lower() != TERMS_HASH.lower():
+        raise APIError(HTTPStatus.BAD_REQUEST, "terms hash mismatch")
+    provided_version = str(payload.get("termsVersion") or payload.get("version") or TERMS_VERSION)
+    if provided_version != TERMS_VERSION:
+        raise APIError(HTTPStatus.BAD_REQUEST, "terms version mismatch")
+    timestamp_raw = payload.get("timestamp") or payload.get("acceptedAt") or payload.get("accepted_at")
+    try:
+        timestamp = int(timestamp_raw)
+    except (TypeError, ValueError):
+        raise APIError(HTTPStatus.BAD_REQUEST, "terms timestamp invalid")
+    if timestamp <= 0:
+        raise APIError(HTTPStatus.BAD_REQUEST, "terms timestamp invalid")
+    if not Account or not encode_structured_data:
+        raise APIError(HTTPStatus.PRECONDITION_FAILED, "terms signature validation unavailable")
+    domain = dict(TERMS_DOMAIN)
+    domain["chainId"] = int(domain.get("chainId", TERMS_CHAIN_ID))
+    domain["verifyingContract"] = _checksum_address(domain.get("verifyingContract", TERMS_VERIFIER))
+    try:
+        wallet_checksum = _checksum_address(wallet_candidate)
+    except Exception as exc:  # pragma: no cover - invalid wallet formatting
+        raise APIError(HTTPStatus.BAD_REQUEST, f"invalid wallet address: {exc}")
+    message = {
+        "wallet": wallet_checksum,
+        "termsHash": terms_hash_value.lower(),
+        "timestamp": timestamp,
+    }
+    typed_data = {
+        "types": TERMS_TYPES,
+        "primaryType": "TermsAcceptance",
+        "domain": domain,
+        "message": message,
+    }
+    try:
+        signable = encode_structured_data(typed_data)
+    except Exception as exc:
+        raise APIError(HTTPStatus.BAD_REQUEST, f"invalid terms acceptance payload: {exc}")
+    try:
+        recovered = Account.recover_message(signable, signature=signature)
+    except Exception as exc:
+        raise APIError(HTTPStatus.BAD_REQUEST, f"invalid terms acceptance signature: {exc}")
+    if recovered.strip().lower() != wallet_norm:
+        raise APIError(HTTPStatus.BAD_REQUEST, "terms signature does not match wallet")
+    return {
+        "wallet": wallet_norm,
+        "termsHash": terms_hash_value.lower(),
+        "timestamp": timestamp,
+        "signature": signature,
+        "termsVersion": provided_version,
+    }
 
 
 def _flatten_accounts(payload: Any) -> Iterable[Dict[str, Any]]:
@@ -892,6 +1026,24 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self._rate_limit() or not self._ensure_authorized():
             return
+        if parsed.path == "/terms":
+            self._json(
+                HTTPStatus.OK,
+                {"data": {"text": TERMS_TEXT, "hash": TERMS_HASH, "version": TERMS_VERSION, "domain": TERMS_DOMAIN}},
+            )
+            return
+        if parsed.path.startswith("/terms/"):
+            parts = parsed.path.split("/")
+            if len(parts) < 3 or not parts[2]:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "missing wallet"})
+                return
+            wallet = parts[2]
+            record = STORE.get_terms_acceptance(wallet)
+            if not record:
+                self._json(HTTPStatus.NOT_FOUND, {"error": "terms acceptance not found"})
+                return
+            self._json(HTTPStatus.OK, {"data": record})
+            return
         if parsed.path == "/loans":
             self._json(HTTPStatus.OK, {"data": list(STORE.list().values())})
             return
@@ -1079,6 +1231,15 @@ class Handler(BaseHTTPRequestHandler):
         if duration <= 0:
             raise ValueError("duration must be greater than zero")
 
+        borrower_wallet = _coalesce_address(
+            payload.get("borrower"),
+            payload.get("beneficiary"),
+            payload.get("beneficiaryAddress"),
+            payload.get("eureWallet"),
+        )
+        if not borrower_wallet:
+            raise APIError(HTTPStatus.PRECONDITION_REQUIRED, "borrower wallet is required")
+
         ltv_bps = int(payload.get("ltvBps") or round(ltv_percent * 100))
         collateral_raw = int(payload.get("collateralRaw") or _to_wei(collateral, BTCB_DECIMALS))
         principal_raw = int(payload.get("principalRaw") or _to_wei(principal, EURE_DECIMALS))
@@ -1099,20 +1260,44 @@ class Handler(BaseHTTPRequestHandler):
 
         pending_events: list[Tuple[str, Dict[str, Any]]] = []
         loan_metadata: Dict[str, Any] = dict(payload)
+        loan_metadata["borrower"] = borrower_wallet
+        terms_payload = dict(payload.get("termsAcceptance") or {})
+        if "signature" not in terms_payload and payload.get("termsSignature"):
+            terms_payload["signature"] = payload["termsSignature"]
+        validated_terms = _validate_terms_acceptance(terms_payload, borrower_wallet)
+        sanitized_terms = {
+            "wallet": validated_terms["wallet"],
+            "termsHash": validated_terms["termsHash"],
+            "timestamp": validated_terms["timestamp"],
+            "termsVersion": validated_terms["termsVersion"],
+        }
+        loan_metadata["termsAcceptance"] = sanitized_terms
+        loan_metadata["termsAcceptedAt"] = validated_terms["timestamp"]
+        loan_metadata["termsAcceptedHash"] = validated_terms["termsHash"]
+        loan_metadata["termsSignature"] = validated_terms["signature"]
+        STORE.record_terms_acceptance(
+            validated_terms["wallet"],
+            validated_terms["termsHash"],
+            validated_terms["signature"],
+            message=sanitized_terms,
+            accepted_at=validated_terms["timestamp"],
+        )
+        pending_events.append(
+            (
+                "terms-accepted",
+                {
+                    "termsHash": validated_terms["termsHash"],
+                    "timestamp": validated_terms["timestamp"],
+                    "termsVersion": validated_terms["termsVersion"],
+                },
+            )
+        )
         monerium_binding: Optional[Dict[str, Any]] = None
         loan_id: Optional[str] = loan_metadata.get("loanId")
         avalanche_tx_hash: Optional[str] = None
         ethereum_tx_hash: Optional[str] = None
 
         if payload.get("disburseVia") == "monerium" and payload.get("iban"):
-            borrower_wallet = (
-                loan_metadata.get("borrower")
-                or loan_metadata.get("beneficiary")
-                or loan_metadata.get("beneficiaryAddress")
-                or loan_metadata.get("eureWallet")
-            )
-            if not borrower_wallet:
-                raise APIError(HTTPStatus.PRECONDITION_REQUIRED, "Missing borrower wallet for Monerium payout")
             try:
                 monerium_binding = STORE.require_monerium_link(str(borrower_wallet), iban=payload["iban"])
             except ValueError as exc:
