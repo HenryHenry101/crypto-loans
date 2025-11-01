@@ -142,6 +142,68 @@ contract AvalancheLoanCoordinatorTest is DSTest {
         assertEq(btcB.balanceOf(address(relayer)), 2 ether, "relayer received tokens");
     }
 
+    function testDirectWithdrawalByManager() public {
+        vm.prank(user);
+        (bytes32 loanId,) = coordinator.depositCollateral(1.5 ether, 5500, 30 days, bytes("proof"));
+        OwnershipToken receipt = coordinator.ownershipToken();
+        _permit(receipt, user, address(coordinator), 1.5 ether);
+        vm.prank(user);
+        coordinator.lockOwnershipToken(loanId);
+
+        coordinator.setEthereumLoanManager(address(this));
+
+        coordinator.initiateWithdrawal(loanId, address(0xBEEF), bytes("manual"));
+
+        assertEq(relayer.lastRecipient(), address(0xBEEF), "manual recipient");
+        assertEq(relayer.lastAmount(), 1.5 ether, "manual amount");
+        assertEq(relayer.lastParams(), bytes("manual"), "manual params");
+        AvalancheLoanCoordinator.Position memory position = coordinator.positions(loanId);
+        assertEq(uint256(position.state), uint256(AvalancheLoanCoordinator.LoanState.Released), "state released");
+    }
+
+    function testKeeperLiquidationFlow() public {
+        vm.prank(user);
+        (bytes32 loanId,) = coordinator.depositCollateral(1 ether, 5000, 30 days, bytes("proof"));
+        coordinator.setKeeper(address(this), true);
+        dex.setExpectedAmountOut(0.98 ether);
+
+        coordinator.liquidate(loanId, address(this), abi.encode(0.95 ether, bytes("swap")));
+
+        assertEq(dex.lastAmountIn(), 1 ether, "keeper liquidation amount");
+        assertEq(stable.balanceOf(address(this)), 0.98 ether, "keeper proceeds");
+        AvalancheLoanCoordinator.Position memory position = coordinator.positions(loanId);
+        assertEq(uint256(position.state), uint256(AvalancheLoanCoordinator.LoanState.Defaulted), "state defaulted");
+    }
+
+    function testUnauthorizedDirectCallsRevert() public {
+        vm.prank(user);
+        (bytes32 loanId,) = coordinator.depositCollateral(1 ether, 5000, 30 days, bytes("proof"));
+        OwnershipToken receipt = coordinator.ownershipToken();
+        _permit(receipt, user, address(coordinator), 1 ether);
+        vm.prank(user);
+        coordinator.lockOwnershipToken(loanId);
+
+        try coordinator.initiateWithdrawal(loanId, address(this), bytes("manual")) {
+            fail("expected authorization revert");
+        } catch (bytes memory err) {
+            bytes4 selector;
+            assembly {
+                selector := mload(add(err, 32))
+            }
+            assertEq(bytes32(selector), bytes32(AvalancheLoanCoordinator.NotAuthorized.selector), "unauthorized withdrawal");
+        }
+
+        try coordinator.liquidate(loanId, address(this), abi.encode(0.9 ether, bytes("swap"))) {
+            fail("expected authorization revert");
+        } catch (bytes memory err2) {
+            bytes4 selector2;
+            assembly {
+                selector2 := mload(add(err2, 32))
+            }
+            assertEq(bytes32(selector2), bytes32(AvalancheLoanCoordinator.NotAuthorized.selector), "unauthorized liquidation");
+        }
+    }
+
     function testDefaultTriggersLiquidation() public {
         vm.prank(user);
         (bytes32 loanId,) = coordinator.depositCollateral(1 ether, 5000, 30 days, bytes("proof"));
