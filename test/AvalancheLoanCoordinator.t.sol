@@ -13,6 +13,16 @@ import {MockAvalancheBridge} from "./mocks/MockAvalancheBridge.sol";
 import {MockBitcoinRelayer} from "./mocks/MockBitcoinRelayer.sol";
 import {MockDexRouter} from "./mocks/MockDexRouter.sol";
 
+interface Vm {
+    function addr(uint256 privateKey) external returns (address);
+
+    function prank(address msgSender) external;
+
+    function sign(uint256 privateKey, bytes32 digest) external returns (uint8 v, bytes32 r, bytes32 s);
+}
+
+Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
+
 contract TestMessenger is ICrossChainMessenger {
     bytes public lastPayload;
     address public lastCaller;
@@ -45,6 +55,9 @@ contract AvalancheLoanCoordinatorTest is DSTest {
     MockBitcoinRelayer private relayer;
     MockDexRouter private dex;
     MockERC20 private stable;
+    address private user;
+
+    uint256 private constant USER_PRIVATE_KEY = 0xA11CE;
 
     function setUp() public {
         btcB = new MockERC20("BTC.b", "BTCB", 18);
@@ -74,22 +87,25 @@ contract AvalancheLoanCoordinatorTest is DSTest {
             500
         );
         messenger.setTarget(address(coordinator));
-        btcB.mint(address(this), 5 ether);
+        user = vm.addr(USER_PRIVATE_KEY);
+        btcB.mint(user, 5 ether);
+        vm.prank(user);
         btcB.approve(address(coordinator), type(uint256).max);
         stable.mint(address(dex), 1000 ether);
     }
 
     function testDepositCreatesPositionAndMintsReceipt() public {
         uint256 expectedPrincipal = (1 ether * oracle.btcEurPrice() * 5000) / 1e18 / 10000;
+        vm.prank(user);
         (bytes32 loanId, uint256 principal) = coordinator.depositCollateral(1 ether, 5000, 30 days, bytes("proof"));
         AvalancheLoanCoordinator.Position memory position = coordinator.positions(loanId);
         OwnershipToken receipt = coordinator.ownershipToken();
 
         assertEq(principal, expectedPrincipal, "principal calculated");
         assertEq(position.collateralAmount, 1 ether, "collateral stored");
-        assertEq(receipt.balanceOf(address(this)), 1 ether, "receipt minted");
+        assertEq(receipt.balanceOf(user), 1 ether, "receipt minted");
         assertTrue(messenger.lastPayload().length > 0, "message emitted");
-        assertEq(bridgeVerifier.lastUser(), address(this), "bridge proof user");
+        assertEq(bridgeVerifier.lastUser(), user, "bridge proof user");
     }
 
     function testDepositRevertsWhenOracleStale() public {
@@ -97,6 +113,7 @@ contract AvalancheLoanCoordinatorTest is DSTest {
         btcUsdFeed.setData(btcUsdFeed.answer(), staleTimestamp);
         eurUsdFeed.setData(eurUsdFeed.answer(), staleTimestamp);
 
+        vm.prank(user);
         try coordinator.depositCollateral(1 ether, 5000, 30 days, bytes("proof")) {
             fail("expected oracle stale revert");
         } catch (bytes memory err) {
@@ -109,9 +126,11 @@ contract AvalancheLoanCoordinatorTest is DSTest {
     }
 
     function testRepaymentReleasesCollateral() public {
+        vm.prank(user);
         (bytes32 loanId,) = coordinator.depositCollateral(2 ether, 6000, 30 days, bytes("proof"));
         OwnershipToken receipt = coordinator.ownershipToken();
-        receipt.approve(address(coordinator), 2 ether);
+        _permit(receipt, user, address(coordinator), 2 ether);
+        vm.prank(user);
         coordinator.lockOwnershipToken(loanId);
 
         bytes memory payload = abi.encode("REPAYMENT_CONFIRMED", loanId, address(this), uint256(0), bytes("btc-params"));
@@ -124,6 +143,7 @@ contract AvalancheLoanCoordinatorTest is DSTest {
     }
 
     function testDefaultTriggersLiquidation() public {
+        vm.prank(user);
         (bytes32 loanId,) = coordinator.depositCollateral(1 ether, 5000, 30 days, bytes("proof"));
         dex.setExpectedAmountOut(0.99 ether);
         bytes memory swapParams = abi.encode(0.97 ether, bytes("swap"));
@@ -131,5 +151,34 @@ contract AvalancheLoanCoordinatorTest is DSTest {
         messenger.forward(payload, bytes("slippage"));
         assertEq(dex.lastAmountIn(), 1 ether, "dex input amount");
         assertEq(stable.balanceOf(address(this)), 0.99 ether, "stable received");
+    }
+
+    function testRestrictsUnauthorizedTransfers() public {
+        vm.prank(user);
+        coordinator.depositCollateral(1 ether, 5000, 30 days, bytes("proof"));
+        OwnershipToken receipt = coordinator.ownershipToken();
+
+        vm.prank(user);
+        try receipt.transfer(address(0xBEEF), 0.5 ether) {
+            fail("expected transfer restriction");
+        } catch (bytes memory err) {
+            bytes4 selector;
+            assembly {
+                selector := mload(add(err, 32))
+            }
+            assertEq(bytes32(selector), bytes32(OwnershipToken.UnauthorizedTransfer.selector), "transfer blocked");
+        }
+    }
+
+    function _permit(OwnershipToken receipt, address owner, address spender, uint256 value) private {
+        uint256 nonce = receipt.nonces(owner);
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes32 structHash = keccak256(
+            abi.encode(receipt.PERMIT_TYPEHASH(), owner, spender, value, nonce, deadline)
+        );
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", receipt.DOMAIN_SEPARATOR(), structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(USER_PRIVATE_KEY, digest);
+        receipt.permit(owner, spender, value, deadline, v, r, s);
+        assertEq(receipt.allowance(owner, spender), value, "permit allowance");
     }
 }

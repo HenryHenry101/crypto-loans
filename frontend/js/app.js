@@ -8,6 +8,7 @@ import {
   readContract,
   reconnect,
   signMessage,
+  signTypedData,
   waitForTransactionReceipt,
   watchAccount,
   writeContract,
@@ -22,11 +23,15 @@ const ERC20_ABI = [
   'function balanceOf(address account) view returns (uint256)',
   'function decimals() view returns (uint8)',
   'function symbol() view returns (string)',
+  'function name() view returns (string)',
+  'function nonces(address owner) view returns (uint256)',
+  'function permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s)',
 ];
 
 const COORDINATOR_ABI = [
   'function depositCollateral(uint256 amountBTCb, uint256 ltvBps, uint64 duration, bytes bridgeProof) returns (bytes32 loanId, uint256 principalEUR)',
   'function lockOwnershipToken(bytes32 loanId)',
+  'function positions(bytes32 loanId) view returns (tuple(address user,uint256 collateralAmount,uint256 vaultShares,uint256 loanPrincipalEUR,uint256 mintedTokens,uint256 ltvBps,uint64 createdAt,uint64 deadline,bytes32 bridgeProofHash,uint8 state))',
 ];
 
 const DEFAULT_SETTINGS = {
@@ -41,6 +46,7 @@ const DEFAULT_SETTINGS = {
   tokens: {
     btcBDecimals: 8,
     ownershipDecimals: 18,
+    ownershipName: 'OwnershipToken',
   },
 };
 
@@ -142,7 +148,9 @@ let tokenMetadata = {
   btcBDecimals: SETTINGS.tokens.btcBDecimals,
   ownershipDecimals: SETTINGS.tokens.ownershipDecimals,
   btcBSymbol: 'BTC.b',
+  btcBName: 'BTC.b',
   ownershipSymbol: 'OWN',
+  ownershipName: SETTINGS.tokens.ownershipName || 'OwnershipToken',
 };
 let historyPollInterval;
 let bridgeStatusTimer;
@@ -203,7 +211,7 @@ async function ensureTokenMetadata() {
   const { btcB, ownershipToken } = SETTINGS.contracts;
   try {
     if (btcB) {
-      const [decimals, symbol] = await Promise.all([
+      const [decimals, symbol, name] = await Promise.all([
         readContract(wagmiConfig, {
           address: btcB,
           abi: ERC20_ABI,
@@ -216,16 +224,23 @@ async function ensureTokenMetadata() {
           functionName: 'symbol',
           chainId: SELECTED_CHAIN.id,
         }),
+        readContract(wagmiConfig, {
+          address: btcB,
+          abi: ERC20_ABI,
+          functionName: 'name',
+          chainId: SELECTED_CHAIN.id,
+        }),
       ]);
       tokenMetadata.btcBDecimals = Number(decimals);
       tokenMetadata.btcBSymbol = symbol;
+      tokenMetadata.btcBName = name;
     }
   } catch (error) {
     console.warn('No se pudieron obtener los metadatos de BTC.b:', error.message);
   }
   try {
     if (ownershipToken) {
-      const [decimals, symbol] = await Promise.all([
+      const [decimals, symbol, name] = await Promise.all([
         readContract(wagmiConfig, {
           address: ownershipToken,
           abi: ERC20_ABI,
@@ -238,9 +253,16 @@ async function ensureTokenMetadata() {
           functionName: 'symbol',
           chainId: SELECTED_CHAIN.id,
         }),
+        readContract(wagmiConfig, {
+          address: ownershipToken,
+          abi: ERC20_ABI,
+          functionName: 'name',
+          chainId: SELECTED_CHAIN.id,
+        }),
       ]);
       tokenMetadata.ownershipDecimals = Number(decimals);
       tokenMetadata.ownershipSymbol = symbol;
+      tokenMetadata.ownershipName = name;
     }
   } catch (error) {
     console.warn('No se pudieron obtener los metadatos de OwnershipToken:', error.message);
@@ -625,8 +647,13 @@ async function handleLockOwnership(event) {
     return;
   }
   const { loanCoordinator } = SETTINGS.contracts;
+  const { ownershipToken } = SETTINGS.contracts;
   if (!loanCoordinator) {
     lockStatus.innerHTML = '<p class="error">Contrato de coordinador no configurado.</p>';
+    return;
+  }
+  if (!ownershipToken) {
+    lockStatus.innerHTML = '<p class="error">OwnershipToken no configurado.</p>';
     return;
   }
   const loanIdRaw = lockLoanId.value.trim();
@@ -636,6 +663,93 @@ async function handleLockOwnership(event) {
   }
   try {
     const loanId = loanIdRaw.startsWith('0x') ? loanIdRaw : `0x${loanIdRaw}`;
+    lockStatus.innerHTML = '<p>Preparando bloqueo…</p>';
+    const position = await readContract(wagmiConfig, {
+      address: loanCoordinator,
+      abi: COORDINATOR_ABI,
+      functionName: 'positions',
+      args: [loanId],
+      chainId: SELECTED_CHAIN.id,
+    });
+    const borrower = (position?.user || position?.[0] || '').toLowerCase();
+    if (borrower !== account.address.toLowerCase()) {
+      lockStatus.innerHTML = '<p class="error">El préstamo no pertenece a la cuenta conectada.</p>';
+      return;
+    }
+    const mintedRaw = position?.mintedTokens ?? position?.[4] ?? 0n;
+    const mintedTokens = typeof mintedRaw === 'bigint' ? mintedRaw : BigInt(mintedRaw || 0);
+    if (mintedTokens === 0n) {
+      lockStatus.innerHTML = '<p class="error">No hay OwnershipToken emitido para este préstamo.</p>';
+      return;
+    }
+    const currentAllowance = await readContract(wagmiConfig, {
+      address: ownershipToken,
+      abi: ERC20_ABI,
+      functionName: 'allowance',
+      args: [account.address, loanCoordinator],
+      chainId: SELECTED_CHAIN.id,
+    });
+    if (BigInt(currentAllowance) < mintedTokens) {
+      lockStatus.innerHTML = '<p>Firmando permit…</p>';
+      const [nonce, tokenName] = await Promise.all([
+        readContract(wagmiConfig, {
+          address: ownershipToken,
+          abi: ERC20_ABI,
+          functionName: 'nonces',
+          args: [account.address],
+          chainId: SELECTED_CHAIN.id,
+        }),
+        tokenMetadata.ownershipName
+          ? Promise.resolve(tokenMetadata.ownershipName)
+          : readContract(wagmiConfig, {
+              address: ownershipToken,
+              abi: ERC20_ABI,
+              functionName: 'name',
+              chainId: SELECTED_CHAIN.id,
+            }),
+      ]);
+      const deadlineSeconds = Math.floor(Date.now() / 1000) + 3600;
+      const domain = {
+        name: tokenName || tokenMetadata.ownershipName || tokenMetadata.ownershipSymbol,
+        version: '1',
+        chainId: SELECTED_CHAIN.id,
+        verifyingContract: ownershipToken,
+      };
+      const types = {
+        Permit: [
+          { name: 'owner', type: 'address' },
+          { name: 'spender', type: 'address' },
+          { name: 'value', type: 'uint256' },
+          { name: 'nonce', type: 'uint256' },
+          { name: 'deadline', type: 'uint256' },
+        ],
+      };
+      const message = {
+        owner: account.address,
+        spender: loanCoordinator,
+        value: mintedTokens.toString(),
+        nonce: BigInt(nonce).toString(),
+        deadline: deadlineSeconds.toString(),
+      };
+      const signature = await signTypedData(wagmiConfig, {
+        account: account.address,
+        domain,
+        types,
+        primaryType: 'Permit',
+        message,
+        chainId: SELECTED_CHAIN.id,
+      });
+      const { v, r, s } = ethers.utils.splitSignature(signature);
+      lockStatus.innerHTML = '<p>Enviando permit…</p>';
+      const permitHash = await writeContract(wagmiConfig, {
+        address: ownershipToken,
+        abi: ERC20_ABI,
+        functionName: 'permit',
+        args: [account.address, loanCoordinator, mintedTokens, BigInt(deadlineSeconds), v, r, s],
+        chainId: SELECTED_CHAIN.id,
+      });
+      await waitForTransactionReceipt(wagmiConfig, { hash: permitHash, chainId: SELECTED_CHAIN.id });
+    }
     lockStatus.innerHTML = '<p>Enviando transacción…</p>';
     const hash = await writeContract(wagmiConfig, {
       address: loanCoordinator,
