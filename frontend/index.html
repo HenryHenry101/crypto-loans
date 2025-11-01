@@ -10,7 +10,16 @@
     <header class="hero">
       <h1>Crypto Loans</h1>
       <p>Solicita préstamos en euros usando tus BTC como colateral sin ceder la custodia.</p>
-      <button id="connectWallet">Conectar Wallet Web3</button>
+      <div class="actions">
+        <label>
+          <span class="label">Conector</span>
+          <select id="connectorSelect">
+            <option value="auto">Auto (injected)</option>
+          </select>
+        </label>
+        <button id="connectWallet">Conectar Wallet Web3</button>
+        <button id="disconnectWallet" class="secondary">Desconectar</button>
+      </div>
     </header>
 
     <main>
@@ -22,20 +31,87 @@
             <span id="walletAddress">No conectada</span>
           </div>
           <div>
-            <span class="label">Saldo BTC detectado</span>
-            <span id="btcBalance">0.00000000 BTC</span>
+            <span class="label">Saldo BTC.b detectado</span>
+            <span id="btcBalance">0.00000000 BTC.b</span>
           </div>
           <div>
-            <span class="label">Saldo BTC.b disponible</span>
-            <span id="btcbBalance">0.0000 BTC.b</span>
+            <span class="label">Saldo OwnershipToken</span>
+            <span id="btcbBalance">0.0000 oToken</span>
           </div>
           <div>
             <span class="label">Cuenta Monerium</span>
             <span id="moneriumStatus">No vinculada</span>
           </div>
           <div>
+            <span class="label">Allowance BTC.b → Coordinador</span>
+            <span id="btcbAllowance">—</span>
+          </div>
+          <div>
+            <span class="label">OwnershipToken → Coordinador</span>
+            <span id="ownershipAllowance">—</span>
+          </div>
+          <div>
             <span class="label">Precio BTC/EUR de referencia</span>
             <span id="btcEurPrice">Actualizando…</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="card" id="collateralActions">
+        <h2>Gestión de colateral en Avalanche</h2>
+        <div class="grid">
+          <div>
+            <h3>Aprobar BTC.b</h3>
+            <form id="approveBtcForm">
+              <label>
+                Monto BTC.b
+                <input type="number" id="approveBtcAmount" min="0" step="0.00000001" placeholder="0.1" />
+              </label>
+              <button type="submit">Aprobar</button>
+            </form>
+            <p class="hint">Concede permiso al coordinador para transferir tu BTC.b como colateral.</p>
+          </div>
+          <div>
+            <h3>Aprobar OwnershipToken</h3>
+            <form id="approveOwnershipForm">
+              <label>
+                Cantidad
+                <input type="number" id="approveOwnershipAmount" min="0" step="0.0001" placeholder="1" />
+              </label>
+              <button type="submit">Aprobar</button>
+            </form>
+            <p class="hint">Permite que el coordinador bloquee tus recibos de préstamo al solicitar un desbloqueo.</p>
+          </div>
+        </div>
+        <div class="grid">
+          <div>
+            <h3>Depositar colateral</h3>
+            <form id="depositCollateralForm">
+              <label>Monto BTC.b
+                <input type="number" id="depositAmount" min="0" step="0.00000001" placeholder="0.25" required />
+              </label>
+              <label>LTV (bps)
+                <input type="number" id="depositLtv" min="1000" max="7000" step="50" value="5000" required />
+              </label>
+              <label>Duración (días)
+                <input type="number" id="depositDuration" min="7" max="365" value="90" required />
+              </label>
+              <label>Bridge proof (base64)
+                <input type="text" id="depositBridgeProof" placeholder="Opcional si el backend valida" />
+              </label>
+              <button type="submit">depositCollateral</button>
+            </form>
+            <div id="depositStatus" class="status"></div>
+          </div>
+          <div>
+            <h3>Bloquear OwnershipToken</h3>
+            <form id="lockOwnershipForm">
+              <label>ID de préstamo (bytes32)
+                <input type="text" id="lockLoanId" placeholder="0x..." required />
+              </label>
+              <button type="submit">lockOwnershipToken</button>
+            </form>
+            <div id="lockStatus" class="status"></div>
           </div>
         </div>
       </section>
@@ -78,6 +154,69 @@
         <p id="platformMetrics">Cargando métricas…</p>
       </section>
 
+      <section class="card" id="bridgeSection">
+        <h2>Bridge Avalanche ↔︎ BTC</h2>
+        <div id="bridgeStatusPanel">
+          <p>Introduce un identificador para consultar el estado o inicia un wrap/unwrap.</p>
+          <div id="bridgeLiveStatus"></div>
+        </div>
+        <form id="bridgeStatusForm" class="stack">
+          <label>ID de transacción del bridge
+            <input type="text" id="bridgeStatusId" placeholder="bridge-tx-id" />
+          </label>
+          <button type="submit" class="secondary">Consultar estado</button>
+        </form>
+        <div class="grid">
+          <div>
+            <h3>Iniciar wrap (BTC → BTC.b)</h3>
+            <form id="bridgeWrapForm">
+              <label>Tx de Bitcoin
+                <input type="text" id="bridgeWrapTx" placeholder="hash de la transacción" required />
+              </label>
+              <label>Wallet objetivo (Avalanche)
+                <input type="text" id="bridgeWrapTarget" placeholder="0x..." required />
+              </label>
+              <label>Red
+                <select id="bridgeWrapNetwork">
+                  <option value="mainnet">Mainnet</option>
+                  <option value="testnet">Fuji</option>
+                </select>
+              </label>
+              <label>Loan ID (opcional)
+                <input type="text" id="bridgeWrapLoanId" placeholder="Para anotar en el historial" />
+              </label>
+              <button type="submit">Iniciar wrap</button>
+            </form>
+            <div id="bridgeWrapStatus" class="status"></div>
+          </div>
+          <div>
+            <h3>Iniciar unwrap (BTC.b → BTC)</h3>
+            <form id="bridgeUnwrapForm">
+              <label>Monto BTC.b
+                <input type="number" id="bridgeUnwrapAmount" min="0" step="0.00000001" placeholder="0.25" required />
+              </label>
+              <label>Dirección BTC destino
+                <input type="text" id="bridgeUnwrapBtc" placeholder="bc1..." required />
+              </label>
+              <label>Fuente BTC.b (Avalanche)
+                <input type="text" id="bridgeUnwrapSource" placeholder="0x..." required />
+              </label>
+              <label>Red
+                <select id="bridgeUnwrapNetwork">
+                  <option value="mainnet">Mainnet</option>
+                  <option value="testnet">Fuji</option>
+                </select>
+              </label>
+              <label>Loan ID (opcional)
+                <input type="text" id="bridgeUnwrapLoanId" placeholder="Para anotar en el historial" />
+              </label>
+              <button type="submit">Iniciar unwrap</button>
+            </form>
+            <div id="bridgeUnwrapStatus" class="status"></div>
+          </div>
+        </div>
+      </section>
+
       <section class="card">
         <h2>Préstamos activos</h2>
         <table id="loansTable">
@@ -115,11 +254,30 @@
         </form>
         <div id="repayStatus"></div>
       </section>
+
+      <section class="card" id="moneriumSection">
+        <h2>Vincular cuenta Monerium</h2>
+        <form id="moneriumLinkForm">
+          <label>IBAN verificado por Monerium
+            <input type="text" id="moneriumIban" placeholder="ES00 0000 0000 0000 0000 0000" required />
+          </label>
+          <label>Mensaje de verificación
+            <textarea id="moneriumMessage" rows="3" placeholder="Se generará automáticamente" readonly></textarea>
+          </label>
+          <button type="submit">Firmar y vincular</button>
+        </form>
+        <div id="moneriumLinkStatus" class="status"></div>
+      </section>
+
+      <section class="card" id="historySection">
+        <h2>Eventos recientes</h2>
+        <div id="historyStream" class="history"></div>
+      </section>
     </main>
 
     <footer>
       <p>Integrado con Monerium, Avalanche y Ethereum. Recuerda mantener un margen de LTV seguro.</p>
     </footer>
-    <script src="js/app.js"></script>
+    <script type="module" src="js/app.js"></script>
   </body>
 </html>
