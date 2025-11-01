@@ -1,12 +1,17 @@
 """Persistent loan store backed by SQLite with audit logging."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
 import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional
+
+
+def normalize_iban(iban: str) -> str:
+    return "".join(iban.split()).upper()
 
 
 def _json_dumps(payload: Dict[str, Any]) -> str:
@@ -54,6 +59,27 @@ class LoanStore:
             self._conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_events_loan ON events(loan_id)
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS monerium_links (
+                    wallet TEXT PRIMARY KEY,
+                    iban TEXT NOT NULL,
+                    monerium_user_id TEXT NOT NULL,
+                    binding_hash TEXT NOT NULL,
+                    signature TEXT NOT NULL,
+                    message TEXT,
+                    metadata TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_monerium_links_hash
+                ON monerium_links(binding_hash)
                 """
             )
 
@@ -131,6 +157,112 @@ class LoanStore:
             events.append({"event": event, "metadata": _json_loads(metadata), "timestamp": ts})
         return events
 
+    def _fetch_monerium_link(self, wallet: str) -> Optional[Dict[str, Any]]:
+        cursor = self._conn.execute(
+            """
+            SELECT wallet, iban, monerium_user_id, binding_hash, signature, message, metadata, created_at, updated_at
+            FROM monerium_links WHERE wallet = ?
+            """,
+            (wallet.lower(),),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        metadata = _json_loads(row[6]) if row[6] else {}
+        return {
+            "wallet": row[0],
+            "iban": row[1],
+            "moneriumUserId": row[2],
+            "bindingHash": row[3],
+            "signature": row[4],
+            "message": row[5],
+            "metadata": metadata,
+            "createdAt": int(row[7]),
+            "updatedAt": int(row[8]),
+            "status": "linked",
+        }
+
+    def link_monerium_wallet(
+        self,
+        wallet: str,
+        iban: str,
+        monerium_user_id: str,
+        signature: str,
+        *,
+        message: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        wallet_norm = wallet.strip().lower()
+        iban_norm = normalize_iban(iban)
+        user_norm = monerium_user_id.strip()
+        if not wallet_norm:
+            raise ValueError("wallet is required")
+        if not iban_norm:
+            raise ValueError("iban is required")
+        if not user_norm:
+            raise ValueError("monerium_user_id is required")
+        metadata = metadata or {}
+        timestamp = int(time.time())
+        digest = hashlib.sha256()
+        digest.update(wallet_norm.encode("utf-8"))
+        digest.update(iban_norm.encode("utf-8"))
+        digest.update(user_norm.encode("utf-8"))
+        binding_hash = digest.hexdigest()
+        metadata_json = _json_dumps(metadata)
+        with self._lock:
+            existing = self._fetch_monerium_link(wallet_norm)
+            created_at = existing["createdAt"] if existing else timestamp
+            with self._conn:  # type: ignore[call-arg]
+                self._conn.execute(
+                    """
+                    INSERT INTO monerium_links(
+                        wallet, iban, monerium_user_id, binding_hash, signature, message, metadata, created_at, updated_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(wallet) DO UPDATE SET
+                        iban = excluded.iban,
+                        monerium_user_id = excluded.monerium_user_id,
+                        binding_hash = excluded.binding_hash,
+                        signature = excluded.signature,
+                        message = excluded.message,
+                        metadata = excluded.metadata,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        wallet_norm,
+                        iban_norm,
+                        user_norm,
+                        binding_hash,
+                        signature,
+                        message,
+                        metadata_json,
+                        created_at,
+                        timestamp,
+                    ),
+                )
+        record = self.get_monerium_link(wallet_norm) or {}
+        return record
+
+    def get_monerium_link(self, wallet: str) -> Optional[Dict[str, Any]]:
+        wallet_norm = wallet.strip().lower()
+        with self._lock:
+            return self._fetch_monerium_link(wallet_norm)
+
+    def require_monerium_link(
+        self,
+        wallet: str,
+        *,
+        iban: Optional[str] = None,
+        monerium_user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        record = self.get_monerium_link(wallet)
+        if not record:
+            raise ValueError("monerium link not found")
+        if iban and normalize_iban(iban) != record.get("iban"):
+            raise ValueError("iban does not match linked account")
+        if monerium_user_id and monerium_user_id.strip() != record.get("moneriumUserId"):
+            raise ValueError("monerium user id does not match linked account")
+        return record
+
     def mark_repaid(self, loan_id: str, amount: float) -> Dict[str, Any]:
         with self._lock:
             loan = self._fetch(loan_id)
@@ -175,4 +307,4 @@ class LoanStore:
             self._conn.close()
 
 
-__all__ = ["LoanStore"]
+__all__ = ["LoanStore", "normalize_iban"]

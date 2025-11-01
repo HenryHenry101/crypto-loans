@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hmac
 import json
 import logging
@@ -14,7 +15,6 @@ import urllib.parse
 import urllib.request
 from collections import deque
 from dataclasses import dataclass
-import binascii
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -31,7 +31,14 @@ except Exception:  # pragma: no cover - fallback when web3 is unavailable
     Contract = None  # type: ignore
     geth_poa_middleware = None  # type: ignore
 
-from store import LoanStore
+from store import LoanStore, normalize_iban
+
+try:  # pragma: no cover - optional dependency for signature recovery
+    from eth_account import Account
+    from eth_account.messages import encode_defunct
+except Exception:  # pragma: no cover - optional dependency missing
+    Account = None  # type: ignore
+    encode_defunct = None  # type: ignore
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -66,6 +73,44 @@ class RateLimiter:
             bucket.append(now)
             return True
 
+
+def _recover_wallet_from_signature(message: str, signature: str, wallet_hint: Optional[str] = None) -> str:
+    signature = str(signature or "").strip()
+    if not signature:
+        raise APIError(HTTPStatus.BAD_REQUEST, "missing signature")
+    wallet_hint_normalized = wallet_hint.strip().lower() if wallet_hint else ""
+    if Account and encode_defunct:
+        try:
+            encoded_message = encode_defunct(text=message)
+            recovered = Account.recover_message(encoded_message, signature=signature)
+            recovered_normalized = recovered.lower()
+        except Exception as exc:
+            raise APIError(HTTPStatus.BAD_REQUEST, f"invalid signature: {exc}")
+        if wallet_hint_normalized and wallet_hint_normalized != recovered_normalized:
+            raise APIError(HTTPStatus.BAD_REQUEST, "signature does not match provided wallet")
+        return recovered_normalized
+    if not wallet_hint_normalized:
+        raise APIError(HTTPStatus.PRECONDITION_REQUIRED, "wallet required to validate signature")
+    return wallet_hint_normalized
+
+
+def _flatten_accounts(payload: Any) -> Iterable[Dict[str, Any]]:
+    stack = [payload]
+    while stack:
+        current = stack.pop()
+        if current is None:
+            continue
+        if isinstance(current, dict):
+            iban_candidate = current.get("iban") or current.get("ibanNumber")
+            if not iban_candidate and isinstance(current.get("account"), dict):
+                iban_candidate = current["account"].get("iban")
+            if iban_candidate:
+                yield current
+            for key in ("accounts", "items", "data", "results", "wallets"):
+                if key in current:
+                    stack.append(current[key])
+        elif isinstance(current, (list, tuple, set)):
+            stack.extend(current)
 
 def _load_abi(default_filename: str, env_var: str) -> Optional[Iterable[Dict[str, Any]]]:
     """Load a contract ABI from disk, preferring env overrides."""
@@ -389,6 +434,29 @@ class MoneriumClient:
             "address": ethereum_address,
         }
         return self._authorized_request("POST", "/wallets/transactions", body)
+
+    def verify_user_iban(self, monerium_user_id: str, iban: str) -> Dict[str, Any]:
+        normalized_iban = normalize_iban(iban)
+        if not monerium_user_id:
+            raise APIError(HTTPStatus.BAD_REQUEST, "Missing Monerium user identifier")
+        path = f"/users/{urllib.parse.quote(monerium_user_id)}/accounts"
+        try:
+            payload = self._authorized_request("GET", path)
+        except APIError as exc:
+            if exc.status == HTTPStatus.NOT_FOUND:
+                raise APIError(HTTPStatus.NOT_FOUND, "Monerium user not found", {"moneriumUserId": monerium_user_id})
+            raise
+        for entry in _flatten_accounts(payload):
+            candidate = entry.get("iban") or entry.get("ibanNumber")
+            if not candidate and isinstance(entry.get("account"), dict):
+                candidate = entry["account"].get("iban")
+            if candidate and normalize_iban(candidate) == normalized_iban:
+                return entry
+        raise APIError(
+            HTTPStatus.BAD_REQUEST,
+            "IBAN not associated with Monerium user",
+            {"iban": normalized_iban, "moneriumUserId": monerium_user_id},
+        )
 
 
 class AvalancheBridgeClient:
@@ -737,6 +805,39 @@ def _start_event_workers() -> None:
         worker.start()
 
 
+def _handle_monerium_link(payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        iban = str(payload["iban"]).strip()
+        monerium_user_id = str(payload["moneriumUserId"]).strip()
+        signature = str(payload["signature"]).strip()
+    except KeyError as exc:
+        raise APIError(HTTPStatus.BAD_REQUEST, f"missing field {exc.args[0]}")
+    message = str(payload.get("message") or "").strip()
+    if not message:
+        raise APIError(HTTPStatus.BAD_REQUEST, "missing message")
+    wallet_hint = (
+        payload.get("wallet")
+        or payload.get("walletAddress")
+        or payload.get("address")
+        or payload.get("borrower")
+    )
+    wallet = _recover_wallet_from_signature(message, signature, wallet_hint)
+    metadata = MONERIUM.verify_user_iban(monerium_user_id, iban)
+    try:
+        record = STORE.link_monerium_wallet(
+            wallet,
+            iban,
+            monerium_user_id,
+            signature,
+            message=message,
+            metadata=metadata if isinstance(metadata, dict) else {},
+        )
+    except ValueError as exc:
+        raise APIError(HTTPStatus.BAD_REQUEST, str(exc))
+    record.setdefault("status", "linked")
+    return record
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "CryptoLoans/1.0"
 
@@ -838,6 +939,18 @@ class Handler(BaseHTTPRequestHandler):
                 {"data": {"total": len(loans), "active": active, "repaid": repaid, "defaulted": defaulted}},
             )
             return
+        if parsed.path.startswith("/monerium/link/"):
+            parts = parsed.path.split("/")
+            if len(parts) < 4 or not parts[3]:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "missing wallet"})
+                return
+            wallet = parts[3]
+            record = STORE.get_monerium_link(wallet)
+            if not record:
+                self._json(HTTPStatus.NOT_FOUND, {"error": "monerium link not found"})
+                return
+            self._json(HTTPStatus.OK, {"data": record})
+            return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
@@ -846,6 +959,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         payload = self._read_json()
         try:
+            if parsed.path == "/monerium/link":
+                record = _handle_monerium_link(payload)
+                self._json(HTTPStatus.OK, {"data": record})
+                return
             if parsed.path == "/loans":
                 loan = self._handle_create_loan(payload)
                 self._json(HTTPStatus.CREATED, {"data": loan})
@@ -854,16 +971,51 @@ class Handler(BaseHTTPRequestHandler):
                 loan_id = str(payload.get("loanId"))
                 amount = float(payload.get("amount", 0))
                 via = payload.get("via", "manual")
+                binding_record: Optional[Dict[str, Any]] = None
+                if via == "iban":
+                    loan_record = STORE.get(loan_id)
+                    if not loan_record:
+                        raise APIError(HTTPStatus.NOT_FOUND, "loan not found for repayment")
+                    borrower = loan_record.get("borrower") or loan_record.get("user")
+                    if not borrower:
+                        raise APIError(HTTPStatus.PRECONDITION_REQUIRED, "loan missing borrower information")
+                    try:
+                        binding_record = STORE.require_monerium_link(str(borrower))
+                    except ValueError as exc:
+                        raise APIError(HTTPStatus.PRECONDITION_REQUIRED, str(exc))
                 loan = STORE.mark_repaid(loan_id, amount)
-                STORE.record_event(loan_id, "repayment-submitted", {"amount": amount, "via": via})
+                metadata = {"amount": amount, "via": via}
+                if binding_record:
+                    metadata["bindingHash"] = binding_record.get("bindingHash")
+                STORE.record_event(loan_id, "repayment-submitted", metadata)
                 self._json(HTTPStatus.OK, {"data": loan})
                 return
             if parsed.path == "/monerium/redeem":
-                result = MONERIUM.redeem(payload["iban"], float(payload.get("amount", 0)), payload.get("reference", "Loan payout"))
+                wallet = payload.get("wallet") or payload.get("walletAddress") or payload.get("address")
+                if not wallet:
+                    raise APIError(HTTPStatus.PRECONDITION_REQUIRED, "wallet is required for Monerium redeem")
+                try:
+                    binding = STORE.require_monerium_link(wallet, iban=payload["iban"])
+                except ValueError as exc:
+                    raise APIError(HTTPStatus.PRECONDITION_REQUIRED, str(exc))
+                result = MONERIUM.redeem(
+                    payload["iban"],
+                    float(payload.get("amount", 0)),
+                    payload.get("reference", "Loan payout"),
+                )
+                result.setdefault("bindingHash", binding.get("bindingHash"))
                 self._json(HTTPStatus.OK, {"data": result})
                 return
             if parsed.path == "/monerium/issue":
-                result = MONERIUM.issue_eure(payload["address"], float(payload.get("amount", 0)))
+                wallet = payload.get("address") or payload.get("wallet")
+                if not wallet:
+                    raise APIError(HTTPStatus.PRECONDITION_REQUIRED, "wallet is required for Monerium issue")
+                try:
+                    binding = STORE.require_monerium_link(wallet)
+                except ValueError as exc:
+                    raise APIError(HTTPStatus.PRECONDITION_REQUIRED, str(exc))
+                result = MONERIUM.issue_eure(wallet, float(payload.get("amount", 0)))
+                result.setdefault("bindingHash", binding.get("bindingHash"))
                 self._json(HTTPStatus.OK, {"data": result})
                 return
             if parsed.path == "/bridge/wrap":
@@ -947,9 +1099,25 @@ class Handler(BaseHTTPRequestHandler):
 
         pending_events: list[Tuple[str, Dict[str, Any]]] = []
         loan_metadata: Dict[str, Any] = dict(payload)
+        monerium_binding: Optional[Dict[str, Any]] = None
         loan_id: Optional[str] = loan_metadata.get("loanId")
         avalanche_tx_hash: Optional[str] = None
         ethereum_tx_hash: Optional[str] = None
+
+        if payload.get("disburseVia") == "monerium" and payload.get("iban"):
+            borrower_wallet = (
+                loan_metadata.get("borrower")
+                or loan_metadata.get("beneficiary")
+                or loan_metadata.get("beneficiaryAddress")
+                or loan_metadata.get("eureWallet")
+            )
+            if not borrower_wallet:
+                raise APIError(HTTPStatus.PRECONDITION_REQUIRED, "Missing borrower wallet for Monerium payout")
+            try:
+                monerium_binding = STORE.require_monerium_link(str(borrower_wallet), iban=payload["iban"])
+            except ValueError as exc:
+                raise APIError(HTTPStatus.PRECONDITION_REQUIRED, str(exc))
+            loan_metadata["moneriumLinkHash"] = monerium_binding.get("bindingHash")
 
         if AVALANCHE_COORDINATOR.available():
             response = AVALANCHE_COORDINATOR.send_transaction(
@@ -1037,8 +1205,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if payload.get("disburseVia") == "monerium" and payload.get("iban"):
             payout = MONERIUM.redeem(payload["iban"], principal, payload.get("reference", "Loan disbursement"))
-            loan = STORE.update(loan_id, moneriumPayout=payout)
-            STORE.record_event(loan_id, "payout-executed", {"provider": "monerium"})
+            update_fields: Dict[str, Any] = {"moneriumPayout": payout}
+            if monerium_binding:
+                update_fields.setdefault("moneriumLinkHash", monerium_binding.get("bindingHash"))
+            loan = STORE.update(loan_id, **update_fields)
+            event_metadata = {"provider": "monerium"}
+            if monerium_binding:
+                event_metadata["bindingHash"] = monerium_binding.get("bindingHash")
+            STORE.record_event(loan_id, "payout-executed", event_metadata)
         return loan
 
 

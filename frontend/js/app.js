@@ -122,6 +122,7 @@ const bridgeUnwrapNetwork = document.getElementById('bridgeUnwrapNetwork');
 const bridgeUnwrapLoanId = document.getElementById('bridgeUnwrapLoanId');
 const moneriumLinkForm = document.getElementById('moneriumLinkForm');
 const moneriumIbanInput = document.getElementById('moneriumIban');
+const moneriumUserIdInput = document.getElementById('moneriumUserId');
 const moneriumMessageInput = document.getElementById('moneriumMessage');
 const moneriumLinkStatus = document.getElementById('moneriumLinkStatus');
 const historyStream = document.getElementById('historyStream');
@@ -462,6 +463,11 @@ async function disconnectWallet() {
     btcbBalanceEl.textContent = '0.0000';
     btcbAllowanceEl.textContent = '—';
     ownershipAllowanceEl.textContent = '—';
+    moneriumLink = undefined;
+    moneriumStatusEl.textContent = 'No vinculada';
+    moneriumMessageInput.value = generateMoneriumMessage('', '');
+    moneriumUserIdInput.value = '';
+    moneriumLinkStatus.innerHTML = '';
     stopHistoryPolling();
   } catch (error) {
     console.warn('No se pudo desconectar la wallet:', error.message);
@@ -475,21 +481,16 @@ async function handleAccountChanged(newAccount) {
     await ensureTokenMetadata();
     await refreshBalances();
     await refreshAllowances();
-    if (moneriumLink && moneriumLink.address === account.address) {
-      moneriumStatusEl.textContent = `Vinculada (${moneriumLink.iban})`;
-      moneriumMessageInput.value = generateMoneriumMessage(moneriumLink.iban, account.address);
-    } else if (moneriumLink) {
-      moneriumStatusEl.textContent = 'IBAN vinculado con otra wallet';
-      moneriumMessageInput.value = generateMoneriumMessage('', account.address);
-    } else {
-      moneriumStatusEl.textContent = 'No vinculada';
-      moneriumMessageInput.value = generateMoneriumMessage('', account.address);
-    }
+    moneriumMessageInput.value = generateMoneriumMessage('', account.address);
+    await syncMoneriumLink();
     startHistoryPolling();
   } else {
     walletAddressEl.textContent = 'No conectada';
-    moneriumStatusEl.textContent = moneriumLink ? `Vinculada (${moneriumLink.iban})` : 'No vinculada';
-    moneriumMessageInput.value = generateMoneriumMessage(moneriumLink?.iban || '', '');
+    moneriumLink = undefined;
+    moneriumStatusEl.textContent = 'No vinculada';
+    moneriumMessageInput.value = generateMoneriumMessage('', '');
+    moneriumUserIdInput.value = '';
+    moneriumLinkStatus.innerHTML = '';
     stopHistoryPolling();
   }
 }
@@ -759,6 +760,49 @@ function generateMoneriumMessage(iban, address) {
   return `Vinculación Monerium\nIBAN: ${iban}\nWallet: ${address || 'sin wallet'}\nTimestamp: ${timestamp}`;
 }
 
+async function fetchMoneriumLink(wallet) {
+  if (!wallet) return null;
+  try {
+    const response = await apiFetch(`/monerium/link/${wallet}`, { method: 'GET' });
+    return response.data || response;
+  } catch (error) {
+    if (error.message.includes('404')) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function syncMoneriumLink() {
+  if (!account || !account.address) {
+    moneriumLink = undefined;
+    moneriumStatusEl.textContent = 'No vinculada';
+    moneriumMessageInput.value = generateMoneriumMessage('', '');
+    return;
+  }
+  try {
+    const record = await fetchMoneriumLink(account.address);
+    if (record) {
+      moneriumLink = record;
+      moneriumStatusEl.textContent = `Vinculada (${record.iban})`;
+      moneriumMessageInput.value = generateMoneriumMessage(record.iban, account.address);
+      if (record.moneriumUserId) {
+        moneriumUserIdInput.value = record.moneriumUserId;
+      }
+      const hashPreview = record.bindingHash ? `${record.bindingHash.slice(0, 12)}…` : '—';
+      moneriumLinkStatus.innerHTML = `<p class="success">Cuenta sincronizada. Hash: ${hashPreview}</p>`;
+    } else {
+      moneriumLink = undefined;
+      moneriumStatusEl.textContent = 'No vinculada';
+      moneriumMessageInput.value = generateMoneriumMessage('', account.address);
+      moneriumLinkStatus.innerHTML = '<p class="warning">No hay una vinculación registrada.</p>';
+    }
+  } catch (error) {
+    moneriumLinkStatus.innerHTML = `<p class="error">No se pudo consultar el enlace de Monerium: ${error.message}</p>`;
+    moneriumStatusEl.textContent = 'Estado desconocido';
+  }
+}
+
 async function handleMoneriumLink(event) {
   event.preventDefault();
   if (!account || !account.address) {
@@ -770,6 +814,11 @@ async function handleMoneriumLink(event) {
     moneriumLinkStatus.innerHTML = '<p class="error">Introduce un IBAN válido.</p>';
     return;
   }
+  const moneriumUserId = moneriumUserIdInput.value.trim();
+  if (!moneriumUserId) {
+    moneriumLinkStatus.innerHTML = '<p class="error">Introduce el ID de usuario de Monerium.</p>';
+    return;
+  }
   const message = generateMoneriumMessage(iban, account.address);
   moneriumMessageInput.value = message;
   try {
@@ -777,41 +826,24 @@ async function handleMoneriumLink(event) {
       message,
       chainId: SELECTED_CHAIN.id,
     });
-    moneriumLink = { iban, signature, address: account.address, timestamp: Date.now() };
-    moneriumLinkStatus.innerHTML = `<p class="success">Cuenta verificada. Firma: ${signature.slice(0, 12)}…</p>`;
-    moneriumStatusEl.textContent = `Vinculada (${iban})`;
-    persistMoneriumLink();
+    const response = await apiFetch('/monerium/link', {
+      method: 'POST',
+      body: JSON.stringify({
+        iban,
+        moneriumUserId,
+        message,
+        signature,
+        wallet: account.address,
+      }),
+    });
+    const record = response.data || response;
+    const hashPreview = record.bindingHash ? `${record.bindingHash.slice(0, 12)}…` : '—';
+    moneriumLinkStatus.innerHTML = `<p class="success">Cuenta vinculada correctamente. Hash: ${hashPreview}</p>`;
+    moneriumUserIdInput.value = record.moneriumUserId || moneriumUserId;
+    await syncMoneriumLink();
   } catch (error) {
-    moneriumLinkStatus.innerHTML = `<p class="error">No se pudo firmar el mensaje: ${error.message}</p>`;
+    moneriumLinkStatus.innerHTML = `<p class="error">No se pudo vincular la cuenta: ${error.message}</p>`;
   }
-}
-
-function restoreMoneriumLink() {
-  try {
-    const stored = window.localStorage.getItem('moneriumLink');
-    if (!stored) return;
-    const parsed = JSON.parse(stored);
-    if (parsed && parsed.address) {
-      moneriumLink = parsed;
-      moneriumStatusEl.textContent = `Vinculada (${parsed.iban})`;
-      moneriumMessageInput.value = generateMoneriumMessage(parsed.iban, parsed.address);
-      moneriumLinkStatus.innerHTML = '<p class="success">Cuenta restaurada desde sesión previa.</p>';
-    }
-  } catch (error) {
-    console.warn('No se pudo restaurar el enlace de Monerium:', error.message);
-  }
-}
-
-function persistMoneriumLink() {
-  if (moneriumLink) {
-    window.localStorage.setItem('moneriumLink', JSON.stringify(moneriumLink));
-  } else {
-    window.localStorage.removeItem('moneriumLink');
-  }
-}
-
-function setupMoneriumPersistence() {
-  window.addEventListener('beforeunload', persistMoneriumLink);
 }
 
 function setupEventListeners() {
@@ -928,8 +960,6 @@ async function initialiseWagmi() {
 }
 
 async function bootstrap() {
-  restoreMoneriumLink();
-  setupMoneriumPersistence();
   if (!moneriumMessageInput.value) {
     moneriumMessageInput.value = generateMoneriumMessage('', '');
   }
