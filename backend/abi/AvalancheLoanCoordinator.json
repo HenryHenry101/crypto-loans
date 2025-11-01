@@ -15,6 +15,38 @@
     "type": "function"
   },
   {
+    "inputs": [{"internalType": "bytes32", "name": "loanId", "type": "bytes32"}],
+    "name": "lockOwnershipToken",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [{"internalType": "bytes32", "name": "loanId", "type": "bytes32"}],
+    "name": "positions",
+    "outputs": [
+      {
+        "components": [
+          {"internalType": "address", "name": "user", "type": "address"},
+          {"internalType": "uint256", "name": "collateralAmount", "type": "uint256"},
+          {"internalType": "uint256", "name": "vaultShares", "type": "uint256"},
+          {"internalType": "uint256", "name": "loanPrincipalEUR", "type": "uint256"},
+          {"internalType": "uint256", "name": "mintedTokens", "type": "uint256"},
+          {"internalType": "uint256", "name": "ltvBps", "type": "uint256"},
+          {"internalType": "uint64", "name": "createdAt", "type": "uint64"},
+          {"internalType": "uint64", "name": "deadline", "type": "uint64"},
+          {"internalType": "bytes32", "name": "bridgeProofHash", "type": "bytes32"},
+          {"internalType": "uint8", "name": "state", "type": "uint8"}
+        ],
+        "internalType": "struct AvalancheLoanCoordinator.Position",
+        "name": "",
+        "type": "tuple"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
     "anonymous": false,
     "inputs": [
       {"indexed": true, "internalType": "bytes32", "name": "loanId", "type": "bytes32"},
