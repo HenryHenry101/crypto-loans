@@ -16,6 +16,8 @@ orquestación y una interfaz web estática para operar los préstamos.
   - `messaging/ChainlinkCCIPMessenger.sol`: adaptador listo para producción que
     conecta con Chainlink CCIP para enviar y recibir payloads entre redes.
   - `messaging/MockMessenger.sol`: mensajero ligero para pruebas locales.
+  - `oracles/ChainlinkPriceOracle.sol`: agrega los feeds de Chainlink para
+    calcular el precio BTC/EUR escalado a 1e18 con tolerancia de 1 hora.
 - `backend/server.py` – Servidor HTTP de producción ligera (sin dependencias
   externas) que actúa como orquestador con integraciones a Monerium y
   Avalanche Bridge, almacenamiento persistente y monitorización de riesgo.
@@ -50,6 +52,25 @@ necesarias en tu entorno local). Las piezas clave son:
 - Registra repagos, adjunta los parámetros necesarios para el bridge de vuelta
   a BTC y envía la orden de liberar el colateral.
 - Permite marcar préstamos en default para iniciar la liquidación.
+
+### `ChainlinkPriceOracle`
+
+- Expone la cotización BTC/EUR a 18 decimales combinando los feeds oficiales de
+  Chainlink.
+- En Avalanche C-Chain se inicializa con los feeds `BTC/USD` y `EUR/USD`
+  publicados por Chainlink (ambos de 8 decimales), lo que permite derivar el
+  precio cruzado.
+- En Ethereum Mainnet se recomienda usar el feed directo `BTC/EUR` y mantener
+  como respaldo los feeds `BTC/USD` y `EUR/USD` para preservar la compatibilidad.
+- La tolerancia de actualización máxima es de una hora (`ORACLE_TIMEOUT`),
+  compartida por ambos coordinadores, lo que evita operar con cotizaciones
+  obsoletas.
+- Las direcciones oficiales para cada feed se mantienen en la documentación de
+  Chainlink y deben configurarse durante el despliegue:
+  - Avalanche C-Chain: [BTC/USD y EUR/USD](https://docs.chain.link/data-feeds/price-feeds/addresses?network=avalanche)
+    (8 decimales).
+  - Ethereum Mainnet: [BTC/EUR, BTC/USD y EUR/USD](https://docs.chain.link/data-feeds/price-feeds/addresses?network=ethereum)
+    (8 decimales).
 
 ### Mensajería cross-chain
 
@@ -121,8 +142,10 @@ Silo, el mensajero y el bridge. Para ejecutarla instala Foundry y lanza:
 forge test
 ```
 
-Esto valida la creación de préstamos, el flujo de repago y la ruta de
-liquidación sobre el contrato `AvalancheLoanCoordinator`.
+Esto valida la creación de préstamos, el flujo de repago, la ruta de
+liquidación sobre el contrato `AvalancheLoanCoordinator` y verifica que el
+oráculo de Chainlink rechace precios caducados o principales que superen los
+límites de LTV derivados de los feeds.
 
 ## Próximos pasos sugeridos
 

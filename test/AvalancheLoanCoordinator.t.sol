@@ -4,10 +4,11 @@ pragma solidity ^0.8.20;
 import {AvalancheLoanCoordinator} from "../contracts/ava/AvalancheLoanCoordinator.sol";
 import {OwnershipToken} from "../contracts/ava/OwnershipToken.sol";
 import {ICrossChainMessenger} from "../contracts/interfaces/ICrossChainMessenger.sol";
+import {ChainlinkPriceOracle} from "../contracts/oracles/ChainlinkPriceOracle.sol";
 import {DSTest} from "./utils/DSTest.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockSiloVault} from "./mocks/MockSiloVault.sol";
-import {MockPriceOracle} from "./mocks/MockPriceOracle.sol";
+import {MockAggregatorV3} from "./mocks/MockAggregatorV3.sol";
 import {MockAvalancheBridge} from "./mocks/MockAvalancheBridge.sol";
 import {MockBitcoinRelayer} from "./mocks/MockBitcoinRelayer.sol";
 import {MockDexRouter} from "./mocks/MockDexRouter.sol";
@@ -36,7 +37,9 @@ contract AvalancheLoanCoordinatorTest is DSTest {
     AvalancheLoanCoordinator private coordinator;
     MockERC20 private btcB;
     MockSiloVault private vault;
-    MockPriceOracle private oracle;
+    ChainlinkPriceOracle private oracle;
+    MockAggregatorV3 private btcUsdFeed;
+    MockAggregatorV3 private eurUsdFeed;
     TestMessenger private messenger;
     MockAvalancheBridge private bridgeVerifier;
     MockBitcoinRelayer private relayer;
@@ -47,7 +50,12 @@ contract AvalancheLoanCoordinatorTest is DSTest {
         btcB = new MockERC20("BTC.b", "BTCB", 18);
         stable = new MockERC20("EURe", "EURE", 18);
         vault = new MockSiloVault(address(btcB));
-        oracle = new MockPriceOracle(20_000 ether, block.timestamp);
+        btcUsdFeed = new MockAggregatorV3(8);
+        eurUsdFeed = new MockAggregatorV3(8);
+        uint256 timestamp = block.timestamp;
+        btcUsdFeed.setData(int256(27_000 * 1e8), timestamp);
+        eurUsdFeed.setData(int256(108_000_000), timestamp); // 1.08 * 1e8 -> 25k EUR/BTC
+        oracle = new ChainlinkPriceOracle(address(btcUsdFeed), address(eurUsdFeed), address(0));
         messenger = new TestMessenger();
         bridgeVerifier = new MockAvalancheBridge();
         relayer = new MockBitcoinRelayer();
@@ -72,15 +80,32 @@ contract AvalancheLoanCoordinatorTest is DSTest {
     }
 
     function testDepositCreatesPositionAndMintsReceipt() public {
+        uint256 expectedPrincipal = (1 ether * oracle.btcEurPrice() * 5000) / 1e18 / 10000;
         (bytes32 loanId, uint256 principal) = coordinator.depositCollateral(1 ether, 5000, 30 days, bytes("proof"));
         AvalancheLoanCoordinator.Position memory position = coordinator.positions(loanId);
         OwnershipToken receipt = coordinator.ownershipToken();
 
-        assertTrue(principal > 0, "principal calculated");
+        assertEq(principal, expectedPrincipal, "principal calculated");
         assertEq(position.collateralAmount, 1 ether, "collateral stored");
         assertEq(receipt.balanceOf(address(this)), 1 ether, "receipt minted");
         assertTrue(messenger.lastPayload().length > 0, "message emitted");
         assertEq(bridgeVerifier.lastUser(), address(this), "bridge proof user");
+    }
+
+    function testDepositRevertsWhenOracleStale() public {
+        uint256 staleTimestamp = block.timestamp - coordinator.ORACLE_TIMEOUT() - 1;
+        btcUsdFeed.setData(btcUsdFeed.answer(), staleTimestamp);
+        eurUsdFeed.setData(eurUsdFeed.answer(), staleTimestamp);
+
+        try coordinator.depositCollateral(1 ether, 5000, 30 days, bytes("proof")) {
+            fail("expected oracle stale revert");
+        } catch (bytes memory err) {
+            bytes4 selector;
+            assembly {
+                selector := mload(add(err, 32))
+            }
+            assertEq(bytes32(selector), bytes32(AvalancheLoanCoordinator.OracleStale.selector), "oracle stale selector");
+        }
     }
 
     function testRepaymentReleasesCollateral() public {
