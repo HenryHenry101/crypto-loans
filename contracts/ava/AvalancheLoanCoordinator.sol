@@ -50,6 +50,7 @@ contract AvalancheLoanCoordinator is Pausable, ReentrancyGuard {
     event CollateralReleased(bytes32 indexed loanId, address indexed user, uint256 amountBTCb);
     event LiquidationTriggered(bytes32 indexed loanId, address indexed user, uint256 amountBTCb);
     event BridgeProofVerified(bytes32 indexed loanId, bytes32 proofHash);
+    event KeeperStatusChanged(address indexed keeper, bool allowed);
 
     error InvalidAmount();
     error InvalidState();
@@ -57,6 +58,8 @@ contract AvalancheLoanCoordinator is Pausable, ReentrancyGuard {
     error NotLoanOwner();
     error VaultShareMismatch();
     error InvalidBridgeProof();
+    error NotAuthorized();
+    error RecipientZero();
 
     uint256 public constant MAX_LTV_BPS = 7000; // 70%
     uint256 public constant ORACLE_TIMEOUT = 1 hours;
@@ -70,6 +73,7 @@ contract AvalancheLoanCoordinator is Pausable, ReentrancyGuard {
 
     mapping(bytes32 => Position) public positions;
     mapping(address => bytes32[]) public userLoans;
+    mapping(address => bool) public authorizedKeepers;
 
     uint64 private _loanCounter;
     address public ethereumLoanManager;
@@ -146,6 +150,18 @@ contract AvalancheLoanCoordinator is Pausable, ReentrancyGuard {
 
     function setPriceOracle(address oracle_) external onlyOwner {
         priceOracle = IPriceOracle(oracle_);
+    }
+
+    function setKeeper(address keeper, bool allowed) external onlyOwner {
+        authorizedKeepers[keeper] = allowed;
+        emit KeeperStatusChanged(keeper, allowed);
+    }
+
+    modifier onlyManagerOrKeeper() {
+        if (msg.sender != ethereumLoanManager && !authorizedKeepers[msg.sender]) {
+            revert NotAuthorized();
+        }
+        _;
     }
 
     function depositCollateral(
@@ -233,6 +249,26 @@ contract AvalancheLoanCoordinator is Pausable, ReentrancyGuard {
         } else {
             revert("UnknownAction");
         }
+    }
+
+    function initiateWithdrawal(bytes32 loanId, address btcRecipient, bytes calldata bridgeParams)
+        external
+        nonReentrant
+        whenNotPaused
+        onlyManagerOrKeeper
+    {
+        if (btcRecipient == address(0)) revert RecipientZero();
+        _processRepayment(loanId, btcRecipient, bridgeParams);
+    }
+
+    function liquidate(bytes32 loanId, address payoutRecipient, bytes calldata unwindParams)
+        external
+        nonReentrant
+        whenNotPaused
+        onlyManagerOrKeeper
+    {
+        if (payoutRecipient == address(0)) revert RecipientZero();
+        _processDefault(loanId, payoutRecipient, 0, unwindParams);
     }
 
     function emergencyWithdraw(address token, address to, uint256 amount) external onlyOwner {

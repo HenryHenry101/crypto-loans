@@ -44,6 +44,9 @@ necesarias en tu entorno local). Las piezas clave son:
   Ethereum libere los EURe.
 - Gestiona el desbloqueo del colateral cuando recibe la confirmación de repago o
   ejecuta la liquidación en caso de impago.
+- Expone accesos directos `initiateWithdrawal` y `liquidate` protegidos para el
+  `ethereumLoanManager` o keepers designados, permitiendo intervenciones manuales
+  sin depender exclusivamente de la mensajería cross-chain.
 
 ### `EthereumLoanCoordinator`
 
@@ -52,6 +55,9 @@ necesarias en tu entorno local). Las piezas clave son:
 - Registra repagos, adjunta los parámetros necesarios para el bridge de vuelta
   a BTC y envía la orden de liberar el colateral.
 - Permite marcar préstamos en default para iniciar la liquidación.
+- Cuando se configura el coordinador de Avalanche en Ethereum, puede ordenar la
+  liberación o liquidación del colateral de forma directa; de lo contrario,
+  recurre al mensaje cross-chain como respaldo.
 
 ### `ChainlinkPriceOracle`
 
@@ -143,9 +149,10 @@ forge test
 ```
 
 Esto valida la creación de préstamos, el flujo de repago, la ruta de
-liquidación sobre el contrato `AvalancheLoanCoordinator` y verifica que el
-oráculo de Chainlink rechace precios caducados o principales que superen los
-límites de LTV derivados de los feeds.
+liquidación sobre el contrato `AvalancheLoanCoordinator`, los accesos directos
+para liberaciones y liquidaciones manuales, y verifica que el oráculo de
+Chainlink rechace precios caducados o principales que superen los límites de
+LTV derivados de los feeds.
 
 ## Próximos pasos sugeridos
 

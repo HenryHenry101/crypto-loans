@@ -6,6 +6,7 @@ import {ReentrancyGuard} from "../libs/ReentrancyGuard.sol";
 import {SafeERC20, IERC20} from "../libs/SafeERC20.sol";
 import {ICrossChainMessenger} from "../interfaces/ICrossChainMessenger.sol";
 import {IPriceOracle} from "../interfaces/IPriceOracle.sol";
+import {IAvalancheLoanCoordinator} from "../interfaces/IAvalancheLoanCoordinator.sol";
 
 /// @title EthereumLoanCoordinator
 /// @notice Manages fiat loans denominated in EURe and communicates with Avalanche collateral manager.
@@ -63,7 +64,7 @@ contract EthereumLoanCoordinator is Pausable, ReentrancyGuard {
     IERC20 public immutable eureToken;
     ICrossChainMessenger public messenger;
     IPriceOracle public priceOracle;
-    address public avalancheCoordinator;
+    IAvalancheLoanCoordinator public avalancheCoordinator;
 
     mapping(bytes32 => Loan) public loans;
     mapping(address => address) public moneriumWalletForUser;
@@ -71,7 +72,7 @@ contract EthereumLoanCoordinator is Pausable, ReentrancyGuard {
     mapping(address => bool) public authorizedOperators;
 
     modifier onlyAvalanche() {
-        require(msg.sender == avalancheCoordinator, "NotAvalanche");
+        require(msg.sender == address(avalancheCoordinator), "NotAvalanche");
         _;
     }
 
@@ -92,7 +93,7 @@ contract EthereumLoanCoordinator is Pausable, ReentrancyGuard {
     }
 
     function setAvalancheCoordinator(address avalancheCoordinator_) external onlyOwner {
-        avalancheCoordinator = avalancheCoordinator_;
+        avalancheCoordinator = IAvalancheLoanCoordinator(avalancheCoordinator_);
     }
 
     function setMoneriumWallet(address user, address eureWallet) external onlyOwner {
@@ -167,7 +168,11 @@ contract EthereumLoanCoordinator is Pausable, ReentrancyGuard {
         loan.status = LoanStatus.Repaid;
 
         bytes memory payload = abi.encode("REPAYMENT_CONFIRMED", loanId, loan.user, amountEURe, bridgeParams);
-        messenger.sendMessage(payload);
+        if (address(avalancheCoordinator) != address(0)) {
+            avalancheCoordinator.initiateWithdrawal(loanId, loan.user, bridgeParams);
+        } else {
+            messenger.sendMessage(payload);
+        }
         emit RepaymentRecorded(loanId, amountEURe, viaMonerium);
         emit CollateralReleaseRequested(loanId, loan.user, bridgeParams);
     }
@@ -177,7 +182,11 @@ contract EthereumLoanCoordinator is Pausable, ReentrancyGuard {
         if (loan.status != LoanStatus.Active) revert InvalidStatus();
         loan.status = LoanStatus.Defaulted;
         bytes memory payload = abi.encode("LOAN_DEFAULT", loanId, loan.user, loan.collateralBTCb, unwindParams);
-        messenger.sendMessage(payload);
+        if (address(avalancheCoordinator) != address(0)) {
+            avalancheCoordinator.liquidate(loanId, loan.user, unwindParams);
+        } else {
+            messenger.sendMessage(payload);
+        }
         emit LoanDefaulted(loanId);
     }
 

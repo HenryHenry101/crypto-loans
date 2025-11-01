@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import {EthereumLoanCoordinator} from "../contracts/eth/EthereumLoanCoordinator.sol";
 import {ICrossChainMessenger} from "../contracts/interfaces/ICrossChainMessenger.sol";
 import {ChainlinkPriceOracle} from "../contracts/oracles/ChainlinkPriceOracle.sol";
+import {IAvalancheLoanCoordinator} from "../contracts/interfaces/IAvalancheLoanCoordinator.sol";
 import {DSTest} from "./utils/DSTest.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockAggregatorV3} from "./mocks/MockAggregatorV3.sol";
@@ -29,11 +30,38 @@ contract MessengerStub is ICrossChainMessenger {
     }
 }
 
+contract AvalancheCoordinatorStub is IAvalancheLoanCoordinator {
+    bytes32 public lastWithdrawalLoanId;
+    address public lastWithdrawalRecipient;
+    bytes public lastWithdrawalParams;
+    uint256 public withdrawalCount;
+
+    bytes32 public lastLiquidationLoanId;
+    address public lastLiquidationRecipient;
+    bytes public lastLiquidationParams;
+    uint256 public liquidationCount;
+
+    function initiateWithdrawal(bytes32 loanId, address btcRecipient, bytes calldata bridgeParams) external override {
+        lastWithdrawalLoanId = loanId;
+        lastWithdrawalRecipient = btcRecipient;
+        lastWithdrawalParams = bridgeParams;
+        withdrawalCount++;
+    }
+
+    function liquidate(bytes32 loanId, address payoutRecipient, bytes calldata unwindParams) external override {
+        lastLiquidationLoanId = loanId;
+        lastLiquidationRecipient = payoutRecipient;
+        lastLiquidationParams = unwindParams;
+        liquidationCount++;
+    }
+}
+
 contract EthereumLoanCoordinatorTest is DSTest {
     EthereumLoanCoordinator private coordinator;
     MockERC20 private eure;
     ChainlinkPriceOracle private oracle;
     MessengerStub private messenger;
+    AvalancheCoordinatorStub private avalanche;
     MockAggregatorV3 private btcUsdFeed;
     MockAggregatorV3 private eurUsdFeed;
     MockAggregatorV3 private btcEurFeed;
@@ -52,7 +80,8 @@ contract EthereumLoanCoordinatorTest is DSTest {
         oracle = new ChainlinkPriceOracle(address(btcUsdFeed), address(eurUsdFeed), address(btcEurFeed));
         coordinator = new EthereumLoanCoordinator(address(eure), address(messenger), address(oracle));
         messenger.setTarget(address(coordinator));
-        coordinator.setAvalancheCoordinator(address(this));
+        avalanche = new AvalancheCoordinatorStub();
+        coordinator.setAvalancheCoordinator(address(avalanche));
         coordinator.setAuthorizedOperator(address(this), true);
         eure.mint(address(this), 10_000 ether);
         eure.approve(address(coordinator), type(uint256).max);
@@ -82,24 +111,54 @@ contract EthereumLoanCoordinatorTest is DSTest {
         assertEq(loan.repaymentDue, expectedRepayment, "repayment includes commission");
     }
 
-    function testRecordRepaymentSendsBridgeMessage() public {
+    function testRecordRepaymentCallsAvalancheDirectly() public {
         testHandleLoanCreatedViaMessenger();
         bytes32 loanId = keccak256("loan-1");
+        messenger.sendMessage("");
         coordinator.recordRepayment(loanId, 1_010 ether, address(this), false, bytes("bridge"));
 
-        bytes memory expected = abi.encode("REPAYMENT_CONFIRMED", loanId, borrower, 1_010 ether, bytes("bridge"));
-        assertEq(keccak256(messenger.lastPayload()), keccak256(expected), "payload matches");
+        assertEq(avalanche.withdrawalCount(), 1, "direct withdrawal count");
+        assertEq(avalanche.lastWithdrawalLoanId(), loanId, "loan id forwarded");
+        assertEq(avalanche.lastWithdrawalRecipient(), borrower, "recipient forwarded");
+        assertEq(keccak256(avalanche.lastWithdrawalParams()), keccak256(bytes("bridge")), "bridge params forwarded");
+        assertEq(messenger.lastPayload().length, 0, "no fallback message");
 
         EthereumLoanCoordinator.Loan memory loan = coordinator.loans(loanId);
         assertTrue(loan.status == EthereumLoanCoordinator.LoanStatus.Repaid, "status repaid");
     }
 
-    function testFlagDefaultSendsLiquidationOrder() public {
+    function testRecordRepaymentFallsBackToMessenger() public {
         testHandleLoanCreatedViaMessenger();
         bytes32 loanId = keccak256("loan-1");
+        coordinator.setAvalancheCoordinator(address(0));
+        messenger.sendMessage("");
+        coordinator.recordRepayment(loanId, 1_010 ether, address(this), false, bytes("bridge"));
+
+        bytes memory expected = abi.encode("REPAYMENT_CONFIRMED", loanId, borrower, 1_010 ether, bytes("bridge"));
+        assertEq(keccak256(messenger.lastPayload()), keccak256(expected), "fallback payload");
+    }
+
+    function testFlagDefaultDirectLiquidation() public {
+        testHandleLoanCreatedViaMessenger();
+        bytes32 loanId = keccak256("loan-1");
+        messenger.sendMessage("");
+        coordinator.flagDefault(loanId, bytes("swap"));
+
+        assertEq(avalanche.liquidationCount(), 1, "direct liquidation count");
+        assertEq(avalanche.lastLiquidationLoanId(), loanId, "liquidation loan");
+        assertEq(avalanche.lastLiquidationRecipient(), borrower, "liquidation recipient");
+        assertEq(keccak256(avalanche.lastLiquidationParams()), keccak256(bytes("swap")), "liquidation params");
+        assertEq(messenger.lastPayload().length, 0, "no liquidation message");
+    }
+
+    function testFlagDefaultFallsBackToMessenger() public {
+        testHandleLoanCreatedViaMessenger();
+        bytes32 loanId = keccak256("loan-1");
+        coordinator.setAvalancheCoordinator(address(0));
+        messenger.sendMessage("");
         coordinator.flagDefault(loanId, bytes("swap"));
         bytes memory expected = abi.encode("LOAN_DEFAULT", loanId, borrower, 2 ether, bytes("swap"));
-        assertEq(keccak256(messenger.lastPayload()), keccak256(expected), "default payload");
+        assertEq(keccak256(messenger.lastPayload()), keccak256(expected), "fallback default payload");
     }
 
     function testMessengerRevertsWhenPriceStale() public {
