@@ -6,15 +6,30 @@ import hmac
 import json
 import logging
 import os
+import queue
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
+from dataclasses import dataclass
+import binascii
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Deque, Dict, Optional, Tuple
+from pathlib import Path
+from typing import Any, Callable, Deque, Dict, Iterable, Optional, Tuple
+
+from hexbytes import HexBytes
+
+try:  # pragma: no cover - optional dependency when running unit tests
+    from web3 import Web3
+    from web3.contract import Contract
+    from web3.middleware import geth_poa_middleware
+except Exception:  # pragma: no cover - fallback when web3 is unavailable
+    Web3 = None  # type: ignore
+    Contract = None  # type: ignore
+    geth_poa_middleware = None  # type: ignore
 
 from store import LoanStore
 
@@ -50,6 +65,253 @@ class RateLimiter:
                 return False
             bucket.append(now)
             return True
+
+
+def _load_abi(default_filename: str, env_var: str) -> Optional[Iterable[Dict[str, Any]]]:
+    """Load a contract ABI from disk, preferring env overrides."""
+
+    path = os.getenv(env_var)
+    if path:
+        candidate = Path(path)
+    else:
+        candidate = Path(__file__).resolve().parent / "abi" / default_filename
+    if not candidate.exists():
+        LOGGER.warning("ABI file missing for %s", default_filename)
+        return None
+    try:
+        with candidate.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception as exc:  # pragma: no cover - unexpected file IO failure
+        LOGGER.error("Unable to load ABI %s: %s", candidate, exc)
+        return None
+
+
+def _init_web3(url: Optional[str]) -> Optional[Web3]:
+    if not Web3 or not url:
+        return None
+    try:
+        provider = Web3.HTTPProvider(url, request_kwargs={"timeout": int(os.getenv("WEB3_TIMEOUT", "15"))})
+        web3 = Web3(provider)
+        if geth_poa_middleware:
+            try:
+                web3.middleware_onion.inject(geth_poa_middleware, layer=0)
+            except ValueError:  # pragma: no cover - already injected
+                pass
+        return web3
+    except Exception as exc:  # pragma: no cover - connection failures
+        LOGGER.error("Failed to initialise web3 provider %s: %s", url, exc)
+        return None
+
+
+def _from_wei(amount: int, decimals: int) -> float:
+    return float(amount) / float(10 ** decimals)
+
+
+def _to_wei(amount: float, decimals: int) -> int:
+    return int(round(float(amount) * (10 ** decimals)))
+
+
+class Web3ContractClient:
+    """Lightweight helper around a coordinator contract."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        url_env: str,
+        address_env: str,
+        abi_filename: str,
+        abi_env: str,
+        key_env: str,
+    ) -> None:
+        self.name = name
+        self.web3 = _init_web3(os.getenv(url_env))
+        self.abi = _load_abi(abi_filename, abi_env)
+        self.address_raw = os.getenv(address_env)
+        self.receipt_timeout = int(os.getenv(f"{name.upper()}_RECEIPT_TIMEOUT", "120"))
+        self.private_key = os.getenv(key_env)
+        self.account_address: Optional[str] = None
+        self.contract: Optional[Contract] = None
+        if self.web3 and self.abi and self.address_raw:
+            try:
+                self.account_address = (
+                    self.web3.eth.account.from_key(self.private_key).address
+                    if self.private_key
+                    else None
+                )
+            except Exception as exc:  # pragma: no cover - invalid key configuration
+                LOGGER.error("Invalid %s operator key: %s", name, exc)
+                self.private_key = None
+                self.account_address = None
+            try:
+                checksum_address = self.web3.to_checksum_address(self.address_raw)
+                self.contract = self.web3.eth.contract(address=checksum_address, abi=self.abi)
+            except Exception as exc:  # pragma: no cover - misconfiguration
+                LOGGER.error("Failed to bind %s contract: %s", name, exc)
+                self.contract = None
+
+    def available(self) -> bool:
+        return bool(self.web3 and self.contract)
+
+    def send_transaction(self, function_name: str, *args: Any, value: int = 0) -> Dict[str, Any]:
+        if not self.available():
+            raise APIError(HTTPStatus.SERVICE_UNAVAILABLE, f"{self.name} coordinator unavailable")
+        if not self.private_key or not self.account_address:
+            raise APIError(HTTPStatus.PRECONDITION_REQUIRED, f"Missing {self.name} operator key")
+        contract_fn = getattr(self.contract.functions, function_name)(*args)
+        nonce = self.web3.eth.get_transaction_count(self.account_address)
+        tx_params: Dict[str, Any] = {
+            "from": self.account_address,
+            "nonce": nonce,
+            "value": value,
+            "gasPrice": self.web3.eth.gas_price,
+            "chainId": self.web3.eth.chain_id,
+        }
+        try:
+            gas = contract_fn.estimate_gas(tx_params)
+        except Exception as exc:
+            raise APIError(HTTPStatus.BAD_REQUEST, f"Gas estimation failed for {self.name}", {"error": str(exc)})
+        tx_params["gas"] = gas
+        try:
+            built = contract_fn.build_transaction(tx_params)
+            signed = self.web3.eth.account.sign_transaction(built, private_key=self.private_key)
+            tx_hash = self.web3.eth.send_raw_transaction(signed.rawTransaction)
+            receipt = self.web3.eth.wait_for_transaction_receipt(tx_hash, timeout=self.receipt_timeout)
+        except Exception as exc:
+            raise APIError(HTTPStatus.BAD_GATEWAY, f"{self.name} transaction failed", {"error": str(exc)})
+        return {"transactionHash": HexBytes(receipt.transactionHash).hex(), "receipt": receipt}
+
+    def decode_events(self, event_name: str, receipt: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+        if not self.available():
+            return []
+        event_abi = getattr(self.contract.events, event_name, None)
+        if not event_abi:
+            return []
+        try:
+            return event_abi().process_receipt(receipt, errors=())
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.error("Failed to decode %s event on %s: %s", event_name, self.name, exc)
+            return []
+
+
+@dataclass
+class WorkItem:
+    name: str
+    callback: Callable[..., Any]
+    args: Tuple[Any, ...]
+    kwargs: Dict[str, Any]
+    attempts: int = 0
+
+
+class TaskQueue:
+    """Retrying background task queue with exponential backoff."""
+
+    def __init__(self, name: str, *, max_retries: int = 5, backoff: float = 5.0) -> None:
+        self.name = name
+        self.max_retries = max_retries
+        self.backoff = backoff
+        self._queue: "queue.Queue[WorkItem]" = queue.Queue()
+        self._stop_event = threading.Event()
+        self._workers: list[threading.Thread] = []
+        worker_count = int(os.getenv(f"{name.upper()}_WORKERS", "1"))
+        for index in range(worker_count):
+            worker = threading.Thread(target=self._run, name=f"{name}-worker-{index}", daemon=True)
+            worker.start()
+            self._workers.append(worker)
+
+    def submit(self, name: str, callback: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
+        self._queue.put(WorkItem(name=name, callback=callback, args=args, kwargs=kwargs))
+
+    def _run(self) -> None:  # pragma: no cover - background worker
+        while not self._stop_event.is_set():
+            try:
+                item = self._queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            try:
+                item.callback(*item.args, **item.kwargs)
+            except Exception as exc:
+                item.attempts += 1
+                if item.attempts <= self.max_retries:
+                    delay = self.backoff * item.attempts
+                    LOGGER.warning(
+                        "%s task %s failed (%s), retrying in %.1fs (attempt %s/%s)",
+                        self.name,
+                        item.name,
+                        exc,
+                        delay,
+                        item.attempts,
+                        self.max_retries,
+                    )
+                    time.sleep(delay)
+                    self._queue.put(item)
+                else:
+                    LOGGER.error("%s task %s failed permanently: %s", self.name, item.name, exc)
+            finally:
+                self._queue.task_done()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+
+class EventWorker(threading.Thread):
+    """Polls on-chain events and dispatches handlers."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        client: Web3ContractClient,
+        event_name: str,
+        handler: Callable[[Dict[str, Any], Dict[str, Any]], None],
+        start_block: Optional[int] = None,
+        interval: int = 15,
+    ) -> None:
+        super().__init__(daemon=True, name=f"{name}-{event_name}")
+        self.client = client
+        self.event_name = event_name
+        self.handler = handler
+        self.interval = interval
+        self._stop_event = threading.Event()
+        self._last_block = start_block
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def run(self) -> None:  # pragma: no cover - background loop
+        if not self.client.available():
+            LOGGER.info("Skipping event worker %s - client unavailable", self.event_name)
+            return
+        LOGGER.info("Event worker %s started", self.event_name)
+        while not self._stop_event.is_set():
+            try:
+                latest = self.client.web3.eth.block_number
+                if self._last_block is None:
+                    self._last_block = latest
+                if latest < self._last_block:
+                    time.sleep(self.interval)
+                    continue
+                if latest == self._last_block:
+                    time.sleep(self.interval)
+                    continue
+                event_abi = getattr(self.client.contract.events, self.event_name, None)
+                if not event_abi:
+                    LOGGER.warning("Event %s missing on %s", self.event_name, self.client.name)
+                    time.sleep(self.interval)
+                    continue
+                from_block = self._last_block + 1
+                logs = event_abi().get_logs(fromBlock=from_block, toBlock=latest)
+                for log in logs:
+                    try:
+                        self.handler(log["args"], log)
+                    except Exception as exc:
+                        LOGGER.exception("Event handler %s failed: %s", self.event_name, exc)
+                self._last_block = latest
+            except Exception as exc:
+                LOGGER.error("Event worker %s error: %s", self.event_name, exc)
+            finally:
+                time.sleep(self.interval)
+        LOGGER.info("Event worker %s stopped", self.event_name)
 
 
 class MoneriumClient:
@@ -271,6 +533,208 @@ RATE_LIMITER = RateLimiter(
     window=int(os.getenv("RATE_LIMIT_WINDOW", "60")),
 )
 RISK_MONITOR = RiskMonitor(STORE, PRICES, interval=int(os.getenv("RISK_INTERVAL", "120")))
+BTCB_DECIMALS = int(os.getenv("BTCB_DECIMALS", "8"))
+EURE_DECIMALS = int(os.getenv("EURE_DECIMALS", "18"))
+
+AVALANCHE_COORDINATOR = Web3ContractClient(
+    name="avalanche",
+    url_env="AVALANCHE_RPC_URL",
+    address_env="AVALANCHE_COORDINATOR_ADDRESS",
+    abi_filename="AvalancheLoanCoordinator.json",
+    abi_env="AVALANCHE_COORDINATOR_ABI",
+    key_env="AVALANCHE_OPERATOR_KEY",
+)
+ETHEREUM_COORDINATOR = Web3ContractClient(
+    name="ethereum",
+    url_env="ETHEREUM_RPC_URL",
+    address_env="ETHEREUM_COORDINATOR_ADDRESS",
+    abi_filename="EthereumLoanCoordinator.json",
+    abi_env="ETHEREUM_COORDINATOR_ABI",
+    key_env="ETHEREUM_OPERATOR_KEY",
+)
+
+MONERIUM_QUEUE = TaskQueue("monerium")
+BRIDGE_QUEUE = TaskQueue("bridge")
+EVENT_WORKERS: list[EventWorker] = []
+
+
+def _loan_id_hex(value: Any) -> str:
+    if isinstance(value, str):
+        return value if value.startswith("0x") else f"0x{value}"
+    try:
+        return HexBytes(value).hex()
+    except Exception:
+        if Web3:
+            return Web3.to_hex(value)
+        raise
+
+
+def _loan_id_bytes(value: str) -> bytes:
+    raw = HexBytes(value)
+    if len(raw) < 32:
+        raw = raw.rjust(32, b"\x00")
+    return bytes(raw)
+
+
+def _encode_bytes(data: Any) -> str:
+    if isinstance(data, (bytes, bytearray)):
+        return base64.b64encode(bytes(data)).decode("ascii")
+    if isinstance(data, str):
+        return data
+    return base64.b64encode(json.dumps(data).encode("utf-8")).decode("ascii")
+
+
+def _execute_monerium_redeem(loan_id: str, iban: str, amount: float, reference: str) -> None:
+    result = MONERIUM.redeem(iban, amount, reference)
+    STORE.update(loan_id, moneriumRedeem=result)
+    STORE.record_event(loan_id, "monerium-redeem", {"amount": amount, "reference": reference})
+
+
+def _execute_bridge_release(loan_id: str, btc_recipient: str, bridge_params: str) -> None:
+    loan = STORE.get(loan_id) or {}
+    collateral = float(loan.get("collateralBTCb") or 0)
+    if collateral <= 0:
+        raise ValueError("unknown collateral amount")
+    network = os.getenv("AVALANCHE_BRIDGE_NETWORK", "mainnet")
+    source_address = loan.get("bridgeSourceAddress") or loan.get("bridge", {}).get("sourceAddress") if isinstance(loan.get("bridge"), dict) else loan.get("bridgeSource", "")
+    if not source_address:
+        source_address = os.getenv("AVALANCHE_BRIDGE_SOURCE", "")
+    result = BRIDGE.initiate_unwrap(collateral, btc_recipient, source_address, network)
+    STORE.record_event(
+        loan_id,
+        "collateral-release-processed",
+        {"btcRecipient": btc_recipient, "bridgeParams": bridge_params, "result": result},
+    )
+
+
+def _handle_repayment_recorded(args: Dict[str, Any], log: Dict[str, Any]) -> None:
+    loan_id = _loan_id_hex(args.get("loanId"))
+    amount_eure = _from_wei(int(args.get("amountEURe", 0)), EURE_DECIMALS)
+    via_monerium = bool(args.get("viaMonerium"))
+    payer = args.get("payer")
+    STORE.record_event(
+        loan_id,
+        "repayment-recorded-onchain",
+        {"amount": amount_eure, "viaMonerium": via_monerium, "payer": payer},
+    )
+    STORE.mark_repaid(loan_id, amount_eure)
+    loan = STORE.get(loan_id) or {}
+    iban = loan.get("iban") if via_monerium else None
+    if not iban and loan.get("disburseVia") == "monerium":
+        iban = loan.get("iban")
+    if iban:
+        reference = loan.get("reference") or f"Loan {loan_id} repayment"
+        MONERIUM_QUEUE.submit(
+            f"monerium-redeem-{loan_id}",
+            _execute_monerium_redeem,
+            loan_id,
+            iban,
+            amount_eure,
+            reference,
+        )
+
+
+def _handle_collateral_release_requested(args: Dict[str, Any], log: Dict[str, Any]) -> None:
+    loan_id = _loan_id_hex(args.get("loanId"))
+    btc_recipient = args.get("btcRecipient")
+    bridge_params = args.get("bridgeParams")
+    encoded_params = _encode_bytes(bridge_params)
+    STORE.record_event(
+        loan_id,
+        "collateral-release-requested",
+        {"btcRecipient": btc_recipient, "bridgeParams": encoded_params},
+    )
+    if btc_recipient:
+        BRIDGE_QUEUE.submit(
+            f"bridge-release-{loan_id}",
+            _execute_bridge_release,
+            loan_id,
+            btc_recipient,
+            encoded_params,
+        )
+
+
+def _handle_liquidation_triggered(args: Dict[str, Any], log: Dict[str, Any]) -> None:
+    loan_id = _loan_id_hex(args.get("loanId"))
+    amount = _from_wei(int(args.get("amountBTCb", 0)), BTCB_DECIMALS)
+    user = args.get("user")
+    STORE.record_event(
+        loan_id,
+        "liquidation-triggered",
+        {"amountBTCb": amount, "user": user},
+    )
+    STORE.mark_default(loan_id, "liquidation", amount)
+
+
+def _handle_loan_registered(args: Dict[str, Any], log: Dict[str, Any]) -> None:
+    loan_id = _loan_id_hex(args.get("loanId"))
+    collateral = _from_wei(int(args.get("collateralBTCb", 0)), BTCB_DECIMALS)
+    principal = _from_wei(int(args.get("principalEUR", 0)), EURE_DECIMALS)
+    deadline = int(args.get("deadline", 0))
+    user = args.get("user")
+    payload = {
+        "loanId": loan_id,
+        "principal": principal,
+        "collateralBTCb": collateral,
+        "deadline": deadline,
+        "borrower": user,
+        "status": "active",
+    }
+    existing = STORE.get(loan_id)
+    if existing:
+        STORE.update(loan_id, **payload)
+    else:
+        STORE.create(payload)
+    STORE.record_event(
+        loan_id,
+        "loan-registered-onchain",
+        {"principal": principal, "collateralBTCb": collateral, "deadline": deadline, "user": user},
+    )
+
+
+def _start_event_workers() -> None:
+    if EVENT_WORKERS:
+        return
+    if ETHEREUM_COORDINATOR.available():
+        EVENT_WORKERS.append(
+            EventWorker(
+                name="ethereum",
+                client=ETHEREUM_COORDINATOR,
+                event_name="RepaymentRecorded",
+                handler=_handle_repayment_recorded,
+                interval=int(os.getenv("ETH_EVENT_INTERVAL", "20")),
+            )
+        )
+        EVENT_WORKERS.append(
+            EventWorker(
+                name="ethereum",
+                client=ETHEREUM_COORDINATOR,
+                event_name="CollateralReleaseRequested",
+                handler=_handle_collateral_release_requested,
+                interval=int(os.getenv("ETH_EVENT_INTERVAL", "20")),
+            )
+        )
+        EVENT_WORKERS.append(
+            EventWorker(
+                name="ethereum",
+                client=ETHEREUM_COORDINATOR,
+                event_name="LoanRegistered",
+                handler=_handle_loan_registered,
+                interval=int(os.getenv("ETH_EVENT_INTERVAL", "20")),
+            )
+        )
+    if AVALANCHE_COORDINATOR.available():
+        EVENT_WORKERS.append(
+            EventWorker(
+                name="avalanche",
+                client=AVALANCHE_COORDINATOR,
+                event_name="LiquidationTriggered",
+                handler=_handle_liquidation_triggered,
+                interval=int(os.getenv("AVAX_EVENT_INTERVAL", "20")),
+            )
+        )
+    for worker in EVENT_WORKERS:
+        worker.start()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -454,26 +918,134 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_create_loan(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         principal = float(payload.get("principal", 0))
         collateral = float(payload.get("collateralBTCb", 0))
-        ltv = float(payload.get("ltv", 0))
+        ltv_percent = float(payload.get("ltv", 0))
         if not principal or not collateral:
             raise ValueError("principal and collateralBTCb are required")
-        if ltv <= 0 or ltv > 70:
+        if ltv_percent <= 0 or ltv_percent > 70:
             raise ValueError("ltv must be between 0 and 70")
         duration = int(payload.get("duration", 0))
         if duration <= 0:
             raise ValueError("duration must be greater than zero")
-        loan = STORE.create(payload)
-        STORE.record_event(loan["loanId"], "loan-validated", {"principal": principal, "collateral": collateral})
+
+        ltv_bps = int(payload.get("ltvBps") or round(ltv_percent * 100))
+        collateral_raw = int(payload.get("collateralRaw") or _to_wei(collateral, BTCB_DECIMALS))
+        principal_raw = int(payload.get("principalRaw") or _to_wei(principal, EURE_DECIMALS))
+        bridge_proof_value = payload.get("bridgeProof", b"")
+        if isinstance(bridge_proof_value, str):
+            bridge_proof_value = bridge_proof_value.strip()
+            if bridge_proof_value:
+                try:
+                    bridge_proof = base64.b64decode(bridge_proof_value)
+                except binascii.Error as exc:
+                    raise ValueError("invalid bridgeProof encoding") from exc
+            else:
+                bridge_proof = b""
+        elif isinstance(bridge_proof_value, (bytes, bytearray)):
+            bridge_proof = bytes(bridge_proof_value)
+        else:
+            bridge_proof = b""
+
+        pending_events: list[Tuple[str, Dict[str, Any]]] = []
+        loan_metadata: Dict[str, Any] = dict(payload)
+        loan_id: Optional[str] = loan_metadata.get("loanId")
+        avalanche_tx_hash: Optional[str] = None
+        ethereum_tx_hash: Optional[str] = None
+
+        if AVALANCHE_COORDINATOR.available():
+            response = AVALANCHE_COORDINATOR.send_transaction(
+                "depositCollateral",
+                collateral_raw,
+                ltv_bps,
+                duration,
+                bridge_proof,
+            )
+            receipt = response["receipt"]
+            events = list(AVALANCHE_COORDINATOR.decode_events("CollateralDeposited", receipt))
+            if not events:
+                raise APIError(HTTPStatus.BAD_GATEWAY, "Collateral deposit confirmation missing")
+            deposit_event = events[0]["args"]
+            loan_id = _loan_id_hex(deposit_event.get("loanId"))
+            collateral_raw = int(deposit_event.get("amountBTCb", collateral_raw))
+            principal_raw = int(deposit_event.get("principalEUR", principal_raw))
+            avalanche_tx_hash = response["transactionHash"]
+            pending_events.append(
+                (
+                    "collateral-deposit-confirmed",
+                    {
+                        "transactionHash": avalanche_tx_hash,
+                        "amountBTCb": _from_wei(collateral_raw, BTCB_DECIMALS),
+                        "principalEUR": _from_wei(principal_raw, EURE_DECIMALS),
+                        "ltvBps": int(deposit_event.get("ltvBps", ltv_bps)),
+                        "deadline": int(deposit_event.get("deadline", duration)),
+                    },
+                )
+            )
+
+        if not loan_id:
+            loan_id = f"loan-{int(time.time() * 1000)}"
+
+        if ETHEREUM_COORDINATOR.available():
+            if not str(loan_id).startswith("0x"):
+                raise APIError(HTTPStatus.PRECONDITION_FAILED, "Unable to fund loan without on-chain identifier")
+            beneficiary = payload.get("beneficiary") or payload.get("beneficiaryAddress") or payload.get("eureWallet")
+            checksum_beneficiary = "0x0000000000000000000000000000000000000000"
+            if beneficiary:
+                checksum_beneficiary = ETHEREUM_COORDINATOR.web3.to_checksum_address(beneficiary)
+            response = ETHEREUM_COORDINATOR.send_transaction(
+                "fundLoan",
+                _loan_id_bytes(loan_id),
+                checksum_beneficiary,
+            )
+            ethereum_tx_hash = response["transactionHash"]
+            events = list(ETHEREUM_COORDINATOR.decode_events("LoanFunded", response["receipt"]))
+            if events:
+                funded_event = events[0]["args"]
+                amount_eure = _from_wei(int(funded_event.get("amountEURe", principal_raw)), EURE_DECIMALS)
+                pending_events.append(
+                    (
+                        "loan-funded-confirmed",
+                        {
+                            "transactionHash": ethereum_tx_hash,
+                            "beneficiary": funded_event.get("beneficiary"),
+                            "amountEURe": amount_eure,
+                        },
+                    )
+                )
+
+        principal = _from_wei(principal_raw, EURE_DECIMALS)
+        collateral = _from_wei(collateral_raw, BTCB_DECIMALS)
+        loan_metadata.update(
+            {
+                "loanId": loan_id,
+                "principal": principal,
+                "collateralBTCb": collateral,
+                "ltv": ltv_percent,
+                "ltvBps": ltv_bps,
+                "duration": duration,
+                "avalancheTxHash": avalanche_tx_hash,
+                "ethereumTxHash": ethereum_tx_hash,
+            }
+        )
+        loan = STORE.create(loan_metadata)
+        STORE.record_event(
+            loan_id,
+            "loan-validated",
+            {"principal": principal, "collateral": collateral, "ltv": ltv_percent},
+        )
+        for event_name, metadata in pending_events:
+            STORE.record_event(loan_id, event_name, metadata)
+
         if payload.get("disburseVia") == "monerium" and payload.get("iban"):
             payout = MONERIUM.redeem(payload["iban"], principal, payload.get("reference", "Loan disbursement"))
-            loan = STORE.update(loan["loanId"], moneriumPayout=payout)
-            STORE.record_event(loan["loanId"], "payout-executed", {"provider": "monerium"})
+            loan = STORE.update(loan_id, moneriumPayout=payout)
+            STORE.record_event(loan_id, "payout-executed", {"provider": "monerium"})
         return loan
 
 
 def run(port: int = 8080) -> None:
     if not RISK_MONITOR.is_alive():
         RISK_MONITOR.start()
+    _start_event_workers()
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     LOGGER.info("Crypto Loans backend listening on http://0.0.0.0:%s", port)
     try:
@@ -482,6 +1054,12 @@ def run(port: int = 8080) -> None:
         LOGGER.info("Shutting down due to interrupt")
     finally:
         RISK_MONITOR.stop()
+        for worker in EVENT_WORKERS:
+            worker.stop()
+        for worker in EVENT_WORKERS:
+            worker.join(timeout=5)
+        MONERIUM_QUEUE.stop()
+        BRIDGE_QUEUE.stop()
         server.shutdown()
         server.server_close()
 

@@ -1,0 +1,54 @@
+[
+  {
+    "inputs": [
+      {"internalType": "bytes32", "name": "loanId", "type": "bytes32"},
+      {"internalType": "address", "name": "beneficiary", "type": "address"}
+    ],
+    "name": "fundLoan",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {"indexed": true, "internalType": "bytes32", "name": "loanId", "type": "bytes32"},
+      {"indexed": true, "internalType": "address", "name": "user", "type": "address"},
+      {"indexed": false, "internalType": "uint256", "name": "collateralBTCb", "type": "uint256"},
+      {"indexed": false, "internalType": "uint256", "name": "principalEUR", "type": "uint256"},
+      {"indexed": false, "internalType": "uint256", "name": "deadline", "type": "uint256"}
+    ],
+    "name": "LoanRegistered",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {"indexed": true, "internalType": "bytes32", "name": "loanId", "type": "bytes32"},
+      {"indexed": true, "internalType": "address", "name": "beneficiary", "type": "address"},
+      {"indexed": false, "internalType": "uint256", "name": "amountEURe", "type": "uint256"}
+    ],
+    "name": "LoanFunded",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {"indexed": true, "internalType": "bytes32", "name": "loanId", "type": "bytes32"},
+      {"indexed": false, "internalType": "uint256", "name": "amountEURe", "type": "uint256"},
+      {"indexed": false, "internalType": "bool", "name": "viaMonerium", "type": "bool"}
+    ],
+    "name": "RepaymentRecorded",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {"indexed": true, "internalType": "bytes32", "name": "loanId", "type": "bytes32"},
+      {"indexed": true, "internalType": "address", "name": "btcRecipient", "type": "address"},
+      {"indexed": false, "internalType": "bytes", "name": "bridgeParams", "type": "bytes"}
+    ],
+    "name": "CollateralReleaseRequested",
+    "type": "event"
+  }
+]
