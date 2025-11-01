@@ -64,6 +64,24 @@ const SETTINGS = {
   },
 };
 
+const TERMS_VERSION = '1';
+const TERMS_TEXT =
+  'Al solicitar este préstamo confirmas que comprendes los riesgos asociados al uso de criptoactivos como colateral, aceptas la liquidación automática en caso de incumplimiento del LTV pactado y autorizas al coordinador a ejecutar el colateral si fuese necesario. Declaras que los fondos no proceden de actividades ilícitas y que cumplirás con la legislación vigente en materia de prevención de blanqueo de capitales.\nLa solicitud queda sujeta a disponibilidad de liquidez en la plataforma y a verificaciones adicionales de seguridad. El incumplimiento de pagos conlleva cargos adicionales y puede resultar en la liquidación total del colateral aportado.';
+const TERMS_HASH = ethers.utils.sha256(ethers.utils.toUtf8Bytes(TERMS_TEXT));
+const TERMS_TYPES = {
+  EIP712Domain: [
+    { name: 'name', type: 'string' },
+    { name: 'version', type: 'string' },
+    { name: 'chainId', type: 'uint256' },
+    { name: 'verifyingContract', type: 'address' },
+  ],
+  TermsAcceptance: [
+    { name: 'wallet', type: 'address' },
+    { name: 'termsHash', type: 'bytes32' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
+};
+
 const CHAIN_REGISTRY = {
   avalanche,
   fuji: avalancheFuji,
@@ -132,6 +150,10 @@ const moneriumUserIdInput = document.getElementById('moneriumUserId');
 const moneriumMessageInput = document.getElementById('moneriumMessage');
 const moneriumLinkStatus = document.getElementById('moneriumLinkStatus');
 const historyStream = document.getElementById('historyStream');
+const termsStatusEl = document.getElementById('termsStatus');
+const loanTermsCheckbox = document.getElementById('loanTermsCheckbox');
+const signTermsButton = document.getElementById('signTermsButton');
+const termsSignatureStatus = document.getElementById('termsSignatureStatus');
 
 const API_BASE = SETTINGS.backendUrl || 'http://localhost:8080';
 const API_KEY = SETTINGS.apiKey || '';
@@ -154,6 +176,8 @@ let tokenMetadata = {
 };
 let historyPollInterval;
 let bridgeStatusTimer;
+let termsAcceptance;
+let storedTermsAcceptance;
 
 function hexFromBase64(input) {
   if (!input) return '0x';
@@ -169,6 +193,149 @@ function hexFromBase64(input) {
     return `0x${Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')}`;
   } catch (error) {
     throw new Error('Bridge proof inválido, asegúrate de usar base64 o 0x');
+  }
+}
+
+function getTermsDomain() {
+  const override = APP_CONFIG.termsDomain || {};
+  const chainId = Number(override.chainId || APP_CONFIG.termsChainId || SELECTED_CHAIN.id);
+  const verifier =
+    override.verifyingContract ||
+    APP_CONFIG.termsVerifier ||
+    SETTINGS.contracts.loanCoordinator ||
+    ethers.constants.AddressZero;
+  let verifyingContract = verifier;
+  try {
+    verifyingContract = ethers.utils.getAddress(verifier);
+  } catch (error) {
+    verifyingContract = ethers.constants.AddressZero;
+  }
+  return {
+    name: override.name || 'CryptoLoans Terms',
+    version: override.version || TERMS_VERSION,
+    chainId,
+    verifyingContract,
+  };
+}
+
+function resetTermsAcceptance(options = {}) {
+  const { clearCheckbox = false } = options;
+  termsAcceptance = undefined;
+  if (termsSignatureStatus) {
+    termsSignatureStatus.textContent = '';
+    termsSignatureStatus.className = 'hint';
+  }
+  if (clearCheckbox && loanTermsCheckbox) {
+    loanTermsCheckbox.checked = false;
+  }
+  updateTermsControlsState();
+}
+
+function updateTermsStatusDisplay(record) {
+  if (!termsStatusEl) return;
+  if (record && record.acceptedAt) {
+    const acceptedAt = new Date(record.acceptedAt * 1000).toLocaleString();
+    const hashPreview = record.termsHash ? `${record.termsHash.slice(0, 12)}…` : '—';
+    termsStatusEl.textContent = `Firmado el ${acceptedAt} · ${hashPreview}`;
+  } else {
+    termsStatusEl.textContent = 'Pendiente';
+  }
+}
+
+async function fetchTermsAcceptanceStatus(wallet) {
+  if (!wallet) return null;
+  try {
+    const response = await apiFetch(`/terms/${wallet}`, { method: 'GET' });
+    return response.data || response;
+  } catch (error) {
+    if (error.message && error.message.includes('404')) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function syncTermsAcceptance(wallet) {
+  if (!wallet) {
+    storedTermsAcceptance = undefined;
+    updateTermsStatusDisplay(null);
+    resetTermsAcceptance({ clearCheckbox: true });
+    return;
+  }
+  try {
+    const record = await fetchTermsAcceptanceStatus(wallet);
+    storedTermsAcceptance = record || undefined;
+    updateTermsStatusDisplay(record || null);
+  } catch (error) {
+    if (termsSignatureStatus) {
+      termsSignatureStatus.className = 'hint error';
+      termsSignatureStatus.textContent = `No se pudo consultar la aceptación: ${error.message}`;
+    }
+    storedTermsAcceptance = undefined;
+    updateTermsStatusDisplay(null);
+  }
+}
+
+function updateTermsControlsState() {
+  if (signTermsButton) {
+    const walletConnected = Boolean(account && account.address);
+    const checkboxChecked = loanTermsCheckbox ? loanTermsCheckbox.checked : false;
+    signTermsButton.disabled = !walletConnected || !checkboxChecked;
+  }
+}
+
+async function handleTermsSignature(event) {
+  event.preventDefault();
+  if (!account || !account.address) {
+    if (termsSignatureStatus) {
+      termsSignatureStatus.className = 'hint error';
+      termsSignatureStatus.textContent = 'Conecta tu wallet antes de firmar los términos.';
+    }
+    return;
+  }
+  if (!loanTermsCheckbox || !loanTermsCheckbox.checked) {
+    if (termsSignatureStatus) {
+      termsSignatureStatus.className = 'hint error';
+      termsSignatureStatus.textContent = 'Debes aceptar los términos antes de firmar.';
+    }
+    return;
+  }
+  const domain = getTermsDomain();
+  const timestamp = Math.floor(Date.now() / 1000);
+  const message = {
+    wallet: account.address,
+    termsHash: TERMS_HASH,
+    timestamp,
+  };
+  try {
+    if (termsSignatureStatus) {
+      termsSignatureStatus.className = 'hint';
+      termsSignatureStatus.textContent = 'Solicitando firma…';
+    }
+    const signature = await signTypedData(wagmiConfig, {
+      account: account.address,
+      domain,
+      types: TERMS_TYPES,
+      primaryType: 'TermsAcceptance',
+      message,
+      chainId: domain.chainId,
+    });
+    termsAcceptance = {
+      wallet: account.address,
+      termsHash: TERMS_HASH,
+      timestamp,
+      signature,
+    };
+    if (termsSignatureStatus) {
+      termsSignatureStatus.className = 'hint success';
+      termsSignatureStatus.textContent = `Firma registrada (${new Date(timestamp * 1000).toLocaleString()}).`;
+    }
+  } catch (error) {
+    termsAcceptance = undefined;
+    if (termsSignatureStatus) {
+      termsSignatureStatus.className = 'hint error';
+      termsSignatureStatus.textContent = `No se pudo firmar los términos: ${error.message}`;
+    }
   }
 }
 
@@ -491,6 +658,10 @@ async function disconnectWallet() {
     moneriumUserIdInput.value = '';
     moneriumLinkStatus.innerHTML = '';
     stopHistoryPolling();
+    storedTermsAcceptance = undefined;
+    resetTermsAcceptance({ clearCheckbox: true });
+    updateTermsStatusDisplay(null);
+    updateTermsControlsState();
   } catch (error) {
     console.warn('No se pudo desconectar la wallet:', error.message);
   }
@@ -505,6 +676,9 @@ async function handleAccountChanged(newAccount) {
     await refreshAllowances();
     moneriumMessageInput.value = generateMoneriumMessage('', account.address);
     await syncMoneriumLink();
+    resetTermsAcceptance({ clearCheckbox: true });
+    await syncTermsAcceptance(account.address);
+    updateTermsControlsState();
     startHistoryPolling();
   } else {
     walletAddressEl.textContent = 'No conectada';
@@ -513,6 +687,10 @@ async function handleAccountChanged(newAccount) {
     moneriumMessageInput.value = generateMoneriumMessage('', '');
     moneriumUserIdInput.value = '';
     moneriumLinkStatus.innerHTML = '';
+    storedTermsAcceptance = undefined;
+    resetTermsAcceptance({ clearCheckbox: true });
+    updateTermsStatusDisplay(null);
+    updateTermsControlsState();
     stopHistoryPolling();
   }
 }
@@ -963,6 +1141,17 @@ async function handleMoneriumLink(event) {
 function setupEventListeners() {
   connectWalletBtn.addEventListener('click', connectWallet);
   disconnectWalletBtn.addEventListener('click', disconnectWallet);
+  if (loanTermsCheckbox) {
+    loanTermsCheckbox.addEventListener('change', () => {
+      if (!loanTermsCheckbox.checked) {
+        resetTermsAcceptance();
+      }
+      updateTermsControlsState();
+    });
+  }
+  if (signTermsButton) {
+    signTermsButton.addEventListener('click', handleTermsSignature);
+  }
   ltvSlider.addEventListener('input', () => {
     ltvValue.textContent = `${ltvSlider.value}%`;
     updateSimulation();
@@ -973,6 +1162,23 @@ function setupEventListeners() {
     event.preventDefault();
     if (!account || !account.address) {
       alert('Conecta tu wallet antes de solicitar un préstamo.');
+      return;
+    }
+    if (!loanTermsCheckbox || !loanTermsCheckbox.checked) {
+      if (termsSignatureStatus) {
+        termsSignatureStatus.className = 'hint error';
+        termsSignatureStatus.textContent = 'Debes aceptar los términos antes de solicitar el préstamo.';
+      }
+      return;
+    }
+    if (termsAcceptance && termsAcceptance.wallet?.toLowerCase() !== account.address.toLowerCase()) {
+      termsAcceptance = undefined;
+    }
+    if (!termsAcceptance || !termsAcceptance.signature) {
+      if (termsSignatureStatus) {
+        termsSignatureStatus.className = 'hint error';
+        termsSignatureStatus.textContent = 'Firma los términos y condiciones antes de continuar.';
+      }
       return;
     }
     try {
@@ -992,6 +1198,13 @@ function setupEventListeners() {
         collateralRaw: ethers.utils.parseUnits(String(btcRequired || 0), tokenMetadata.btcBDecimals).toString(),
         principalRaw: ethers.utils.parseUnits(String(eurAmount || 0), 18).toString(),
         bridgeProof: depositBridgeProof.value || '',
+        termsAcceptance: {
+          wallet: account.address,
+          termsHash: TERMS_HASH,
+          timestamp: termsAcceptance.timestamp,
+          signature: termsAcceptance.signature,
+          termsVersion: TERMS_VERSION,
+        },
       };
       const response = await apiFetch('/loans', {
         method: 'POST',
@@ -1000,11 +1213,20 @@ function setupEventListeners() {
       simulationOutput.innerHTML = '<p class="success">Préstamo solicitado correctamente. Sigue las instrucciones del bridge de Avalanche en tu wallet.</p>';
       eurAmountInput.value = '';
       btcRequiredInput.value = '';
+      if (termsSignatureStatus) {
+        termsSignatureStatus.className = 'hint success';
+        termsSignatureStatus.textContent = 'Aceptación enviada correctamente.';
+      }
       await refreshLoans();
       await refreshMetrics();
+      await syncTermsAcceptance(account.address);
       console.info('Loan created', response.data);
     } catch (error) {
       simulationOutput.innerHTML = `<p class="error">No se pudo solicitar el préstamo: ${error.message}</p>`;
+      if (termsSignatureStatus) {
+        termsSignatureStatus.className = 'hint error';
+        termsSignatureStatus.textContent = `Error al enviar la aceptación: ${error.message}`;
+      }
     }
   });
   repayForm.addEventListener('submit', async (event) => {
@@ -1036,6 +1258,7 @@ function setupEventListeners() {
   bridgeWrapForm.addEventListener('submit', handleBridgeWrap);
   bridgeUnwrapForm.addEventListener('submit', handleBridgeUnwrap);
   moneriumLinkForm.addEventListener('submit', handleMoneriumLink);
+  updateTermsControlsState();
 }
 
 async function initialiseWagmi() {

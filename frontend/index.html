@@ -54,6 +54,10 @@
             <span class="label">Precio BTC/EUR de referencia</span>
             <span id="btcEurPrice">Actualizando…</span>
           </div>
+          <div>
+            <span class="label">Aceptación T&C</span>
+            <span id="termsStatus">Pendiente</span>
+          </div>
         </div>
       </section>
 
@@ -144,6 +148,26 @@
           <label>Referencia de transferencia
             <input type="text" id="reference" placeholder="Referencia de pago" />
           </label>
+          <section class="terms" id="loanTermsSection">
+            <h3>Términos y Condiciones</h3>
+            <p>
+              Al solicitar este préstamo confirmas que comprendes los riesgos asociados al uso de criptoactivos como
+              colateral, aceptas la liquidación automática en caso de incumplimiento del LTV pactado y autorizas al
+              coordinador a ejecutar el colateral si fuese necesario. Declaras que los fondos no proceden de actividades
+              ilícitas y que cumplirás con la legislación vigente en materia de prevención de blanqueo de capitales.
+            </p>
+            <p>
+              La solicitud queda sujeta a disponibilidad de liquidez en la plataforma y a verificaciones adicionales de
+              seguridad. El incumplimiento de pagos conlleva cargos adicionales y puede resultar en la liquidación total
+              del colateral aportado.
+            </p>
+            <label class="checkbox">
+              <input type="checkbox" id="loanTermsCheckbox" />
+              <span>He leído y acepto los términos y condiciones anteriores.</span>
+            </label>
+            <button type="button" id="signTermsButton" class="secondary">Firmar aceptación T&amp;C</button>
+            <p id="termsSignatureStatus" class="hint"></p>
+          </section>
           <button type="submit">Request Loan</button>
         </form>
         <div id="simulationOutput"></div>
