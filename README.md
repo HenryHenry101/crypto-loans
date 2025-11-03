@@ -139,6 +139,12 @@ La aplicación permite:
   API key.
 - Visualizar métricas agregadas y el historial de eventos de cada préstamo.
 
+### Guías de usuario
+
+- [Onboarding de usuarios finales](docs/user-onboarding.md): pasos detallados
+  para vincular Monerium, configurar wallets compatibles con Avalanche Bridge y
+  firmar los términos y condiciones cumpliendo los requisitos de Compliance.
+
 ## Pruebas automatizadas
 
 La carpeta `test/` contiene una suite de Foundry con mocks de BTC.b, la vault de
