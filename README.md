@@ -145,6 +145,23 @@ La aplicación permite:
   para vincular Monerium, configurar wallets compatibles con Avalanche Bridge y
   firmar los términos y condiciones cumpliendo los requisitos de Compliance.
 
+## Entornos y despliegues
+
+La guía [docs/environments.md](docs/environments.md) resume las redes,
+direcciones de contratos, variables del backend y políticas operativas que se
+esperan en cada entorno:
+
+- **Desarrollo (`dev`)**: Avalanche Fuji + Ethereum Sepolia, integraciones con
+  Monerium sandbox y uso exclusivo de tokens de prueba.
+- **Preproducción (`preprod`)**: mainnets con límites de monto estrictos y
+  mensajería CCIP en modo restringido.
+- **Producción (`prod`)**: parámetros finales aprobados por DevOps y Compliance,
+  incluyendo cuentas Monerium de producción y monitoreo 24/7.
+
+> Antes de desplegar, coordina con DevOps/Compliance para validar que los
+> parámetros cargados en los gestores de secretos, contratos y pipelines
+> coinciden con la infraestructura disponible.
+
 ## Pruebas automatizadas
 
 La carpeta `test/` contiene una suite de Foundry con mocks de BTC.b, la vault de
