@@ -1,0 +1,82 @@
+[
+  {
+    "inputs": [
+      {"internalType": "uint256", "name": "amountBTCb", "type": "uint256"},
+      {"internalType": "uint256", "name": "ltvBps", "type": "uint256"},
+      {"internalType": "uint64", "name": "duration", "type": "uint64"},
+      {"internalType": "bytes", "name": "bridgeProof", "type": "bytes"}
+    ],
+    "name": "depositCollateral",
+    "outputs": [
+      {"internalType": "bytes32", "name": "loanId", "type": "bytes32"},
+      {"internalType": "uint256", "name": "principalEUR", "type": "uint256"}
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [{"internalType": "bytes32", "name": "loanId", "type": "bytes32"}],
+    "name": "lockOwnershipToken",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [{"internalType": "bytes32", "name": "loanId", "type": "bytes32"}],
+    "name": "positions",
+    "outputs": [
+      {
+        "components": [
+          {"internalType": "address", "name": "user", "type": "address"},
+          {"internalType": "uint256", "name": "collateralAmount", "type": "uint256"},
+          {"internalType": "uint256", "name": "vaultShares", "type": "uint256"},
+          {"internalType": "uint256", "name": "loanPrincipalEUR", "type": "uint256"},
+          {"internalType": "uint256", "name": "mintedTokens", "type": "uint256"},
+          {"internalType": "uint256", "name": "ltvBps", "type": "uint256"},
+          {"internalType": "uint64", "name": "createdAt", "type": "uint64"},
+          {"internalType": "uint64", "name": "deadline", "type": "uint64"},
+          {"internalType": "bytes32", "name": "bridgeProofHash", "type": "bytes32"},
+          {"internalType": "uint8", "name": "state", "type": "uint8"}
+        ],
+        "internalType": "struct AvalancheLoanCoordinator.Position",
+        "name": "",
+        "type": "tuple"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {"indexed": true, "internalType": "bytes32", "name": "loanId", "type": "bytes32"},
+      {"indexed": true, "internalType": "address", "name": "user", "type": "address"},
+      {"indexed": false, "internalType": "uint256", "name": "amountBTCb", "type": "uint256"},
+      {"indexed": false, "internalType": "uint256", "name": "principalEUR", "type": "uint256"},
+      {"indexed": false, "internalType": "uint256", "name": "ltvBps", "type": "uint256"},
+      {"indexed": false, "internalType": "uint64", "name": "deadline", "type": "uint64"}
+    ],
+    "name": "CollateralDeposited",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {"indexed": true, "internalType": "bytes32", "name": "loanId", "type": "bytes32"},
+      {"indexed": true, "internalType": "address", "name": "user", "type": "address"},
+      {"indexed": false, "internalType": "uint256", "name": "amountBTCb", "type": "uint256"}
+    ],
+    "name": "CollateralReleased",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {"indexed": true, "internalType": "bytes32", "name": "loanId", "type": "bytes32"},
+      {"indexed": true, "internalType": "address", "name": "user", "type": "address"},
+      {"indexed": false, "internalType": "uint256", "name": "amountBTCb", "type": "uint256"}
+    ],
+    "name": "LiquidationTriggered",
+    "type": "event"
+  }
+]
